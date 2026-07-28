@@ -379,7 +379,28 @@ async function boot() {
   const lightRig = new LightRig(scene, { slots: 8, updateHz: 12 });
   const adopted = lightRig.adopt(scene);
   ctx.lightRig = lightRig;
-  console.info(`[lights] adopted ${adopted} point lights into ${lightRig.slotCount} slots`);
+
+  /*
+   * Practical lights were authored against a scene lit uniformly by a bright
+   * sky IBL, where they only ever needed to be a hint. Now that interiors
+   * attenuate that IBL and auto-exposure lifts the room to compensate, a 17-26
+   * candela fixture at 5 m contributes about 5% of what the eye has adapted to
+   * — the fixtures glow but cast no pool, which a review correctly called out
+   * as "decorative". Indoors the practicals ARE the light, so they have to
+   * carry the room.
+   *
+   * Scaled here rather than in the level so one number governs the whole
+   * relationship, and so it stays with the exposure model that created the
+   * problem. Outdoors these are invisible either way at daylight exposure.
+   */
+  const PRACTICAL_BOOST = 4.2;
+  for (const v of lightRig.virtual) {
+    v.intensity *= PRACTICAL_BOOST;
+    // Reach has to grow with intensity or the pool is clipped by the falloff
+    // sphere long before it fades, which reads as a hard circle on the floor.
+    v.distance *= 1.45;
+  }
+  console.info(`[lights] adopted ${adopted} practicals into ${lightRig.slotCount} slots`);
 
   // ------------------------------------------------------------- player ---
   await step('Deploying operator', 0.55);

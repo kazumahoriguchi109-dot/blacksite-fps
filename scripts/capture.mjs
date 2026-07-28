@@ -33,23 +33,31 @@ const H = parseInt(args.height || '1080', 10);
  */
 const POSES = [
   // yaw 0 looks toward -Z (north, into the compound); yaw PI looks +Z (the gate).
-  // NOTE: no per-pose `fov`. The game runs at 60 vertical; overriding it here
-  // meant every review was judged on a 75-85 degree render that the player
-  // never sees. Framing is chosen at the real FOV.
-  { name: '01_courtyard_wide',    pos: [4, 1.65, 20],     yaw: -0.42,     pitch: 0.02 },
-  { name: '02_admin_facade',      pos: [0, 1.65, -14],    yaw: 0,         pitch: 0.10 },
-  { name: '03_container_alley',   pos: [-32, 1.65, -20],  yaw: Math.PI,   pitch: 0.0 },
-  { name: '04_warehouse_int',     pos: [32, 1.65, 16],    yaw: 0,         pitch: 0.04 },
-  { name: '05_gate_looking_out',  pos: [0, 1.65, 40],     yaw: Math.PI,   pitch: -0.02 },
+  //
+  // pos[1] is the FOOT height (0 = standing on the ground). It is NOT an eye
+  // height: several poses carried 1.65 here after the convention changed, which
+  // started the player 1.65 m in the air to fall onto whatever was below. The
+  // harness now flags any pose whose achieved eye height drifts from foot+1.63
+  // (or foot+1.02 crouched), which is how these were found.
+  //
+  // No per-pose `fov`. The game runs at 60 vertical; overriding it meant every
+  // review was judged on a 75-85 degree render the player never sees.
+  { name: '01_courtyard_wide',    pos: [4, 0, 20],        yaw: -0.42,     pitch: 0.02 },
+  { name: '02_admin_facade',      pos: [0, 0, -14],       yaw: 0,         pitch: 0.10 },
+  { name: '03_container_alley',   pos: [-32, 0, -20],     yaw: Math.PI,   pitch: 0.0 },
+  // Central aisle, clear of the racking rows at x = 24.5 / 31 / 37.5.
+  { name: '04_warehouse_int',     pos: [28, 0, 9],        yaw: 0,         pitch: 0.04 },
+  { name: '05_gate_looking_out',  pos: [0, 0, 40],        yaw: Math.PI,   pitch: -0.02 },
   { name: '06_wreck_closeup',     pos: [-6.5, 0, -1.5],   yaw: 0.51,      pitch: -0.05, crouch: true },
   { name: '07_sandbags_ground',   pos: [-6, 0, 11],       yaw: 0.15,      pitch: -0.20, crouch: true },
-  { name: '08_roof_overlook',     pos: [0, 12.6, -26],    yaw: Math.PI,   pitch: -0.14 },
-  { name: '09_into_sun',          pos: [10, 1.65, 10],    yaw: 0,         pitch: 0.22, faceSun: true },
-  { name: '10_viewmodel_ads',     pos: [4, 1.65, 24],     yaw: 0,         pitch: -0.02, ads: true },
-  { name: '11_viewmodel_hip',     pos: [-14, 1.65, 10],   yaw: -0.6,      pitch: -0.03 },
+  { name: '08_roof_overlook',     pos: [0, 10.95, -26],   yaw: Math.PI,   pitch: -0.14 },
+  { name: '09_into_sun',          pos: [10, 0, 10],       yaw: 0,         pitch: 0.22, faceSun: true },
+  { name: '10_viewmodel_ads',     pos: [4, 0, 24],        yaw: 0,         pitch: -0.02, ads: true },
+  { name: '11_viewmodel_hip',     pos: [-14, 0, 10],      yaw: -0.6,      pitch: -0.03 },
   { name: '12_material_detail',   pos: [0, 0, -15.5],     yaw: 0,         pitch: 0.04, crouch: true },
-  { name: '13_warehouse_catwalk', pos: [42.4, 6.90, 15],  yaw: 0.50,      pitch: -0.14 },
-  { name: '14_alley_containers',  pos: [-30, 1.65, -8],   yaw: 0.9,       pitch: 0.02 },
+  // Catwalk deck sits at y = 5.2 with a 0.12 grating; stand just inboard of it.
+  { name: '13_warehouse_catwalk', pos: [41.6, 5.32, 12],  yaw: 0.55,      pitch: -0.14 },
+  { name: '14_alley_containers',  pos: [-30, 0, -8],      yaw: 0.9,       pitch: 0.02 },
 ];
 
 const only = args.only ? String(args.only).split(',').map((s) => s.trim()) : null;
@@ -306,7 +314,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await sleep(320);
     const file = path.join(OUT, `${p.name}.png`);
     await retry(() => page.screenshot({ path: file }), `${p.name} shot`);
-    console.log(`  ✓ ${p.name}  (eye ${eye} m)`);
+    // Collision ejects the player if a pose lands inside geometry, which
+    // silently reframes the shot — 04_warehouse_int spent several rounds
+    // outdoors on top of a rack this way. Expected eye is foot + 1.63
+    // standing, foot + 1.02 crouched.
+    const expected = (p.pos[1] || 0.02) + (p.crouch ? 1.02 : 1.63);
+    const drift = Math.abs(eye - expected);
+    console.log(`  ✓ ${p.name}  (eye ${eye} m)`
+      + (drift > 0.4 ? `  ** EJECTED: expected ${expected.toFixed(2)} m — pose is inside geometry **` : ''));
   }
 
   await writeFile(path.join(OUT, 'stats.json'), JSON.stringify({ stats, poses: poses.map(p => p.name) }, null, 2));
