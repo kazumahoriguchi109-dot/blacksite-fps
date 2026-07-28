@@ -1,0 +1,10 @@
+import puppeteer from 'puppeteer';
+const b = await puppeteer.launch({headless:true,args:['--no-sandbox','--enable-gpu','--use-angle=metal','--enable-unsafe-swiftshader','--ignore-gpu-blocklist']});
+const p = await b.newPage();
+p.on('pageerror', e=>console.log('[pageerror]', e.stack?.slice(0,2500)));
+p.on('console', async m=>{ const t=m.text(); if(/fatal|error/i.test(t)){ console.log('[c]',t.slice(0,500));
+  for (const h of m.args()) { try { const s = await h.evaluate(v => (v && v.stack) ? v.stack : null); if (s) console.log('[stack]', s.slice(0,2500)); } catch {} } } });
+await p.goto('http://127.0.0.1:5188',{waitUntil:'domcontentloaded'});
+await new Promise(r=>setTimeout(r,100000));
+console.log('game?', await p.evaluate(()=>!!window.__game));
+await b.close();
