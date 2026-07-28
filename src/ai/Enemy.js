@@ -177,11 +177,28 @@ function material(kind, seed, repeat, color, extra) {
  * Two injections, both cheap and both confined to enemies — the terrain must
  * not get them or the separation they buy is cancelled out.
  *
- *  1. ALBEDO TRIM (after <map_fragment>). The camo tile is authored dark and
- *     busy. Lifting its value and pushing saturation slightly is what stops a
- *     body at 20 m from sitting at the same luminance as asphalt. It is done
- *     in a rough gamma-2 space so "+0.04 value" means what it would mean in an
- *     image editor rather than being swallowed by the linear curve.
+ *  1. ALBEDO RE-KEY (after <map_fragment>). The camo tile is authored dark
+ *     (linear albedo 0.03-0.11, i.e. darker than the asphalt it is standing on)
+ *     and its pattern swings a full stop of value at a spatial frequency finer
+ *     than anything in the level. Both of those are backwards: a character has
+ *     to be the *simplest* thing on screen and it has to sit at a different
+ *     value from the terrain.
+ *
+ *     So the tile is flattened toward its own mean (uCon, about the measured
+ *     gamma-space pivot uPivot) and then the whole surface is re-keyed with
+ *     gain/lift. uCon is the important one — it is what turns "high-frequency
+ *     noise that destroys the silhouette" into a uniform with a bit of
+ *     variation in it. Done in a rough gamma-2 space so the numbers mean what
+ *     they would mean in an image editor instead of being swallowed by the
+ *     linear curve.
+ *
+ *     uTint then rotates hue at constant luma. This matters more than it
+ *     sounds: measured, this level's ground runs hue 33-35 and the old uniform
+ *     sat at hue 39 — no hue separation at all, so the figure had only value to
+ *     work with, and there is no single value that beats both sunlit asphalt
+ *     (0.23) and asphalt in shadow (0.11). Pushing the uniform to olive puts a
+ *     second, independent axis between the man and the ground, which is why it
+ *     survives when a cloud crosses the sun.
  *
  *  2. RIM (into totalEmissiveRadiance, so it goes through fog and exposure
  *     like real light and is not multiplied down by AO). A Fresnel term biased
@@ -190,7 +207,7 @@ function material(kind, seed, repeat, color, extra) {
  *     cartoon outline, and it draws the whole silhouette — helmet flare,
  *     shoulder line, weapon, boots — out of whatever is behind it.
  */
-const RIM_CACHE_KEY = 'blacksite_char_rim_v1';
+const RIM_CACHE_KEY = 'blacksite_char_rim_v2';
 
 function characterShader(m, o) {
   const u = {
@@ -200,6 +217,9 @@ function characterShader(m, o) {
     uSat: { value: o.sat ?? 1 },
     uLift: { value: o.lift ?? 0 },
     uGain: { value: o.gain ?? 1 },
+    uCon: { value: o.con ?? 1 },
+    uPivot: { value: o.pivot ?? 0.235 },
+    uTint: { value: new THREE.Color(...(o.tint ?? [1, 1, 1])) },
   };
   m.userData.charUniforms = u;
   m.onBeforeCompile = (sh) => {
@@ -211,12 +231,17 @@ uniform float uRimAmt;
 uniform float uRimPow;
 uniform float uSat;
 uniform float uLift;
-uniform float uGain;`)
+uniform float uGain;
+uniform float uCon;
+uniform float uPivot;
+uniform vec3 uTint;`)
       .replace('#include <map_fragment>', `#include <map_fragment>
 {
   vec3 pc = sqrt( max( diffuseColor.rgb, vec3( 0.0 ) ) );
   float plum = dot( pc, vec3( 0.2126, 0.7152, 0.0722 ) );
-  pc = clamp( mix( vec3( plum ), pc, uSat ) * uGain + uLift, 0.0, 1.0 );
+  pc = mix( vec3( plum ), pc, uSat );
+  pc = ( pc - uPivot ) * uCon + uPivot;
+  pc = clamp( pc * uGain + uLift, 0.0, 1.0 ) * uTint;
   diffuseColor.rgb = pc * pc;
 }`)
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
@@ -246,13 +271,18 @@ let BLOB = null;
 function blobAssets() {
   if (BLOB) return BLOB;
   const N = 64, data = new Uint8Array(N * N * 4);
+  // Flat opaque core out to 0.36 m, then a short penumbra to the 0.50 m edge.
+  // The old profile started falling off at the centre, so by the time it had
+  // been through fog, bloom and the tone curve there was no single pixel dark
+  // enough to register as contact — it read as a smudge, which is exactly the
+  // complaint. Occlusion under a boot is nearly binary; draw it that way.
+  const CORE = 0.52;
   for (let y = 0; y < N; y++) {
     for (let x = 0; x < N; x++) {
       const u = ((x + 0.5) / N) * 2 - 1;
       const v = ((y + 0.5) / N) * 2 - 1;
       const r = Math.min(1, Math.sqrt(u * u + v * v));
-      // Dense core, fast falloff: contact shadow, not a drop shadow.
-      const a = Math.pow(1 - r, 1.35) * (0.62 + 0.38 * (1 - r));
+      const a = r <= CORE ? 1 : Math.pow(1 - (r - CORE) / (1 - CORE), 1.6);
       const i = (y * N + x) * 4;
       const b = Math.round(THREE.MathUtils.clamp(a, 0, 1) * 255);
       data[i] = data[i + 1] = data[i + 2] = b;
@@ -265,12 +295,12 @@ function blobAssets() {
   tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
   tex.needsUpdate = true;
 
-  const geo = new THREE.CircleGeometry(0.48, 20).rotateX(-Math.PI / 2);
+  const geo = new THREE.CircleGeometry(0.42, 20).rotateX(-Math.PI / 2);
   const mat = new THREE.MeshBasicMaterial({
-    color: 0x05070a,
+    color: 0x040609,
     alphaMap: tex,
     transparent: true,
-    opacity: 0.72,
+    opacity: 0.60,
     depthWrite: false,
     fog: false,
     toneMapped: false,
@@ -287,24 +317,39 @@ function blobAssets() {
 function shared() {
   if (SHARED) return SHARED;
 
-  // Repeat is halved against the old 1.7: the camo was running at a higher
-  // spatial frequency than any surface in the level, so soldiers read as the
-  // noisiest thing on screen instead of the cleanest.
+  // VALUE PLAN. Three tiers, and they are the whole reason a figure reads at
+  // 20 m: a light uniform (linear albedo ~0.15, comfortably above the 0.05-0.08
+  // asphalt), dark load-bearing gear across the chest and on the head, and dark
+  // boots. Light limbs / dark chest block / dark helmet is the pattern every
+  // shipped shooter uses, because two hard value edges inside the outline
+  // survive when the outline itself is only thirty pixels wide.
+  //
+  // Repeat drops 0.85 -> 0.26. At 0.85 a camo blob was about 4 cm across, which
+  // at 12 m is two pixels — pure noise, and noise at a finer scale than the
+  // level's own materials. At 0.26 a blob is ~13 cm, so it reads as a pattern
+  // on a uniform rather than as static, and `con` throws away most of its
+  // contrast on top of that.
   const mats = {
-    camo: characterShader(material('camo', 0x51D0, [0.85, 0.85], 0xf0eee7), {
-      rimColor: 0x9db2c6, rimAmt: 0.28, rimPow: 3.3,
-      sat: 0.99, lift: 0.038, gain: 0.99,
+    camo: characterShader(material('camo', 0x51D0, [0.26, 0.26], 0xffffff), {
+      rimColor: 0x9db2c6, rimAmt: 0.26, rimPow: 3.2,
+      sat: 0.88, pivot: 0.235, con: 0.40, gain: 1.34, lift: 0.068,
+      // Measured: this tint lands the uniform at hue ~55, saturation ~0.30,
+      // against ground at hue 33 / saturation 0.15. Three times this much was
+      // tried and it made a highlighter-green soldier — which is a worse
+      // version of the "green smudge" the review already objected to. The point
+      // is a *different* colour family from the terrain, not a loud one.
+      tint: [0.945, 1.022, 0.890],
     }),
-    gear: characterShader(material('polymer', 0x2A17, [0.9, 0.9], 0x6b6e74), {
-      rimColor: 0xa4b8cc, rimAmt: 0.22, rimPow: 3.4,
-      sat: 1.0, lift: 0.014, gain: 1.0,
+    gear: characterShader(material('polymer', 0x2A17, [0.55, 0.55], 0x4c4e52), {
+      rimColor: 0xa4b8cc, rimAmt: 0.24, rimPow: 3.4,
+      sat: 1.0, pivot: 0.30, con: 0.55, gain: 0.95, lift: 0.0,
     }),
     // The face is its own material only because it is the one surface that
     // must never go to black. A helmeted, masked head lit from behind reads as
     // a hole in the silhouette otherwise, and a hole is what the eye calls
     // "unfinished". Lifted balaclava, brighter rim, so the brow, goggles and
     // jaw stay separable at conversational range.
-    face: characterShader(material('polymer', 0x2A17, [0.9, 0.9], 0x9ea099, {
+    face: characterShader(material('polymer', 0x2A17, [0.55, 0.55], 0x9ea099, {
       // A floor under the face. The helmet brim self-shadows everything below
       // it, so with the sun anywhere behind the agent the face receives almost
       // nothing and collapses to black — which is precisely the "dark slab
@@ -313,38 +358,56 @@ function shared() {
       emissive: 0x2c333a,
     }), {
       rimColor: 0xbccbd8, rimAmt: 0.32, rimPow: 2.8,
-      sat: 0.9, lift: 0.042, gain: 1.0,
+      sat: 0.9, pivot: 0.30, con: 0.6, gain: 1.0, lift: 0.042,
     }),
-    // The plate carrier is deliberately a different value from the camo. An
-    // internal light/dark split is what keeps a body from collapsing into one
-    // flat blob the moment it is more than a few metres away — but it is a
-    // dusty mid-tone, not a white bib, or the carrier becomes the character.
-    vest: characterShader(material('polymer', 0x2A17, [1.0, 1.0], 0x968f7c), {
-      rimColor: 0xa8bacc, rimAmt: 0.23, rimPow: 3.2,
-      sat: 0.94, lift: 0.024, gain: 1.0,
+    // The plate carrier, its pouches, and the helmet shell all share this. It
+    // is the *dark* tier and it is deliberately near-flat: a hard, quiet value
+    // break across the chest and around the head is what says "kit on a man"
+    // at a distance where no individual pouch is more than a pixel. Making it
+    // busy would just re-introduce the problem the camo had.
+    vest: characterShader(material('polymer', 0x2A17, [0.6, 0.6], 0x41443e), {
+      rimColor: 0xa8bacc, rimAmt: 0.15, rimPow: 3.4,
+      sat: 0.9, pivot: 0.30, con: 0.45, gain: 0.80, lift: 0.0,
+      tint: [0.90, 1.02, 0.94],
     }),
     // Metalness is 1 here, so there is almost no diffuse to lift and an
     // over-strong rim turns the weapon into white plastic. Keep it modest —
     // just enough to draw the barrel line out of a dark background.
-    gun: characterShader(material('gunmetal', 0x77B3, [1.2, 1.2], 0xa8adb5), {
-      rimColor: 0xb4c4d4, rimAmt: 0.17, rimPow: 3.2,
-      sat: 1.0, lift: 0.0, gain: 1.0,
+    // Deliberately a mid grey rather than a dark one. The weapon has to cross
+    // the dark plate carrier on its way out of the torso outline; if it is the
+    // same value as the carrier, the half of the rifle that is in front of the
+    // chest disappears and only the tips read. A mid value separates from both
+    // the dark gear and the light uniform.
+    gun: characterShader(material('gunmetal', 0x77B3, [0.8, 0.8], 0x9fa5ad), {
+      rimColor: 0xc4d4e4, rimAmt: 0.30, rimPow: 2.8,
+      sat: 1.0, pivot: 0.35, con: 0.7, gain: 1.0, lift: 0.035,
     }),
   };
 
   const geo = {};
 
-  // ---- helmet: shell + rear counterweight + rails + NVG shroud + strap ----
+  // ---- helmet ----
+  // A smooth dome is a bicycle helmet. What makes a combat helmet identifiable
+  // in outline is that the shell is not the widest thing on it: a shell edge
+  // flares proud all the way round, a brow brim projects forward over the
+  // goggles, an NVG mount stands up off the front, and a strap comes down past
+  // the jaw. Those four break the dome into something with a top, a front and a
+  // bottom at any resolution, so it stops reading as a ball.
   geo.helmet = merge([
-    put(new THREE.SphereGeometry(0.128, 16, 12, 0, TAU, 0, Math.PI * 0.60),
-      0, 0.108, 0.004, 0, 0, 0, 1.0, 0.96, 1.05),
-    put(boxG(0.135, 0.075, 0.085), 0, 0.075, 0.115),          // rear counterweight
-    put(boxG(0.055, 0.05, 0.045), 0, 0.155, -0.10),            // NVG shroud
-    put(boxG(0.016, 0.032, 0.155), -0.118, 0.095, -0.005),     // left rail
-    put(boxG(0.016, 0.032, 0.155), 0.118, 0.095, -0.005),      // right rail
-    put(torG(0.104, 0.010, 5, 12), 0, 0.036, 0.004, Math.PI / 2, 0, 0, 1, 1.06, 1),
-    put(boxG(0.03, 0.055, 0.02), -0.085, 0.02, -0.055, 0.3, 0, 0),  // chin strap L
-    put(boxG(0.03, 0.055, 0.02), 0.085, 0.02, -0.055, 0.3, 0, 0),   // chin strap R
+    put(new THREE.SphereGeometry(0.130, 16, 12, 0, TAU, 0, Math.PI * 0.60),
+      0, 0.104, 0.004, 0, 0, 0, 1.0, 0.98, 1.05),
+    // shell edge: 2.5 cm proud of the dome, flattened, so the helmet has a hard
+    // horizontal line under it instead of curving straight into the head
+    put(torG(0.142, 0.018, 5, 14), 0, 0.036, 0.004, Math.PI / 2, 0, 0, 1, 0.62, 1.03),
+    put(boxG(0.250, 0.026, 0.090), 0, 0.043, -0.108, -0.20),   // brow brim, tipped down
+    put(boxG(0.150, 0.086, 0.098), 0, 0.070, 0.120),           // rear counterweight
+    put(boxG(0.072, 0.058, 0.060), 0, 0.150, -0.096),          // NVG mount base
+    put(boxG(0.034, 0.086, 0.034), 0, 0.202, -0.086, 0.26),    // NVG arm, stood up
+    put(boxG(0.022, 0.036, 0.170), -0.128, 0.092, -0.005),     // left rail
+    put(boxG(0.022, 0.036, 0.170), 0.128, 0.092, -0.005),      // right rail
+    put(boxG(0.026, 0.100, 0.020), -0.107, -0.020, -0.040, 0.30, 0, 0.22),  // strap L
+    put(boxG(0.026, 0.100, 0.020), 0.107, -0.020, -0.040, 0.30, 0, -0.22),  // strap R
+    put(boxG(0.072, 0.030, 0.038), 0, -0.062, -0.062),         // chin cup
   ]);
 
   // ---- head: balaclava skull, brow, jaw, goggles, neck ----
@@ -367,7 +430,7 @@ function shared() {
     put(boxG(0.205, 0.020, 0.030), 0, 0.140, -0.052),           // goggle strap band
     put(cylG(0.026, 0.026, 0.03, 8), -0.090, 0.112, -0.048, 0, 0, Math.PI / 2),
     put(cylG(0.026, 0.026, 0.03, 8), 0.090, 0.112, -0.048, 0, 0, Math.PI / 2),
-    put(cylG(0.049, 0.058, 0.145, 10), 0, -0.058, 0.006),       // neck
+    put(cylG(0.050, 0.060, 0.170, 10), 0, -0.070, 0.006),       // neck
   ]);
 
   // ---- torso: ribcage, abdomen, one continuous shoulder yoke, pack hump ----
@@ -375,12 +438,18 @@ function shared() {
   // side. Two spheres on a box gives you two hard seams at the exact place a
   // player's eye goes first; one mass wide enough to swallow each arm's own
   // deltoid cap gives you a shoulder line instead.
+  //
+  // It is also wider than it was (0.250 -> 0.272 half-width) and the collar has
+  // dropped 2 cm. Wide-at-the-top / narrow-at-the-hips is the proportion the
+  // eye actually uses to call a shape human at thirty pixels, and the dropped
+  // collar is what leaves a throat between the yoke and the jaw — a helmet
+  // resting straight on the shoulders is the loudest "toy" cue there is.
   geo.torso = merge([
     put(cylG(0.150, 0.134, 0.30, 14), 0, 0.400, 0, 0, 0, 0, 1, 1, 0.72),
     put(cylG(0.134, 0.124, 0.24, 14), 0, 0.160, 0, 0, 0, 0, 1, 1, 0.76),
-    put(sphG(1, 18, 11), 0, 0.462, -0.004, 0, 0, 0, 0.250, 0.110, 0.130),
-    put(sphG(1, 12, 8), 0, 0.492, 0.004, 0, 0, 0, 0.146, 0.066, 0.106), // trapezius
-    put(torG(0.058, 0.018, 5, 12), 0, 0.543, 0.004, Math.PI / 2, 0, 0, 1, 1.0, 1),
+    put(sphG(1, 18, 11), 0, 0.458, -0.004, 0, 0, 0, 0.272, 0.112, 0.132),
+    put(sphG(1, 12, 8), 0, 0.488, 0.004, 0, 0, 0, 0.150, 0.062, 0.106), // trapezius
+    put(torG(0.058, 0.017, 5, 12), 0, 0.522, 0.004, Math.PI / 2, 0, 0, 1, 1.0, 1),
     put(sphG(0.112, 10, 8), 0, 0.395, 0.086, 0, 0, 0, 1.05, 1.30, 0.55),
   ]);
 
@@ -397,8 +466,14 @@ function shared() {
     put(boxG(0.100, 0.320, 0.040), -0.116, 0.396, 0.082, 0, -0.42, 0),
     put(boxG(0.100, 0.320, 0.040), 0.116, 0.396, 0.082, 0, 0.42, 0),
     put(cylG(0.152, 0.146, 0.130, 14), 0, 0.248, 0, 0, 0, 0, 1, 1, 0.78), // cummerbund
-    put(boxG(0.076, 0.048, 0.250), -0.098, 0.516, 0.000, 0.06),        // shoulder strap L
-    put(boxG(0.076, 0.048, 0.250), 0.098, 0.516, 0.000, 0.06),         // shoulder strap R
+    put(boxG(0.076, 0.048, 0.250), -0.098, 0.514, 0.000, 0.06),        // shoulder strap L
+    put(boxG(0.076, 0.048, 0.250), 0.098, 0.514, 0.000, 0.06),         // shoulder strap R
+    // Deltoid protectors. They stand 2.7 cm proud of the arm, which takes the
+    // shoulder line out to 0.575 m — the widest thing on the figure by a clear
+    // margin, and dark, so the top of the silhouette is a definite horizontal
+    // bar rather than a soft shrug.
+    put(boxG(0.105, 0.072, 0.205), -0.235, 0.486, -0.004, 0, 0, 0.26),
+    put(boxG(0.105, 0.072, 0.205), 0.235, 0.486, -0.004, 0, 0, -0.26),
     put(boxG(0.074, 0.140, 0.058), -0.083, 0.298, -0.148),             // mag pouch 1
     put(boxG(0.074, 0.140, 0.058), 0.000, 0.300, -0.154),              // mag pouch 2
     put(boxG(0.074, 0.140, 0.058), 0.083, 0.298, -0.148),              // mag pouch 3
@@ -412,6 +487,10 @@ function shared() {
     put(sphG(0.036, 8, 6), 0.146, 0.318, -0.096),
     put(boxG(0.112, 0.098, 0.052), 0.112, 0.182, -0.120, 0, 0, -0.2),  // dump pouch
     put(boxG(0.090, 0.062, 0.050), -0.128, 0.196, -0.104, 0, 0.3, 0),  // utility pouch
+    // Sling across the chest, corner to corner. One long diagonal inside a
+    // rectangle is worth more at range than any amount of pouch detail.
+    put(boxG(0.044, 0.400, 0.024), -0.052, 0.400, -0.128, 0, 0, 0.62),
+    put(boxG(0.044, 0.330, 0.024), 0.070, 0.410, 0.116, 0, 0, -0.55),
   ]);
 
   // ---- pelvis: hips, belt, drop leg pouch ----
@@ -468,10 +547,10 @@ function shared() {
     put(cylG(0.064, 0.052, 0.095, 9), 0, -0.368, 0),           // bloused cuff
   ]);
   geo.boot = merge([
-    put(boxG(0.104, 0.052, 0.155), 0, -0.045, -0.018),
-    put(boxG(0.098, 0.042, 0.085), 0, -0.062, -0.104),         // toe
-    put(boxG(0.090, 0.038, 0.062), 0, -0.058, 0.055),          // heel
-    put(boxG(0.095, 0.045, 0.132), 0, -0.008, -0.010),         // ankle cuff
+    put(boxG(0.108, 0.052, 0.165), 0, -0.045, -0.020),
+    put(boxG(0.100, 0.040, 0.100), 0, -0.064, -0.118),         // toe
+    put(boxG(0.094, 0.038, 0.070), 0, -0.058, 0.062),          // heel
+    put(boxG(0.098, 0.045, 0.132), 0, -0.008, -0.010),         // ankle cuff
   ]);
 
   // ---- rifle: built along -Z, origin at the pistol grip ----
@@ -482,10 +561,11 @@ function shared() {
     put(boxG(0.054, 0.092, 0.300), 0, 0.020, -0.055),          // receiver
     put(boxG(0.052, 0.060, 0.265), 0, 0.022, -0.305),          // handguard
     put(cylG(0.021, 0.021, 0.250, 8), 0, 0.024, -0.312, Math.PI / 2, 0, 0),
-    put(cylG(0.0110, 0.0110, 0.215, 8), 0, 0.026, -0.525, Math.PI / 2, 0, 0),
-    put(cylG(0.023, 0.023, 0.098, 9), 0, 0.026, -0.648, Math.PI / 2, 0, 0), // flash hider
+    put(cylG(0.0135, 0.0135, 0.215, 8), 0, 0.026, -0.525, Math.PI / 2, 0, 0),
+    put(boxG(0.030, 0.060, 0.034), 0, 0.052, -0.452),          // gas block / front sight
+    put(cylG(0.028, 0.028, 0.105, 9), 0, 0.026, -0.650, Math.PI / 2, 0, 0), // flash hider
     put(boxG(0.042, 0.118, 0.050), 0, -0.062, 0.030, 0.26),    // pistol grip
-    put(boxG(0.034, 0.190, 0.078), 0, -0.104, -0.096, -0.16),  // magazine
+    put(boxG(0.040, 0.195, 0.080), 0, -0.106, -0.096, -0.16),  // magazine
     put(boxG(0.030, 0.030, 0.070), 0, -0.192, -0.112, -0.16),  // mag floorplate
     put(boxG(0.048, 0.072, 0.190), 0, 0.012, 0.160),           // stock tube
     put(boxG(0.056, 0.112, 0.038), 0, 0.006, 0.266),           // buttpad
@@ -602,6 +682,7 @@ export class Enemy {
     this.aimW = 0;
     this.aimWTarget = 0;
     this.aimPose = 0;
+    this.shoulder = 0;
     this.aimPitch = 0;
     this.aimYaw = 0;
     this.staggerX = 0; this.staggerZ = 0;
@@ -668,16 +749,20 @@ export class Enemy {
     B.chest.add(mesh(geo.torso, mats.camo, true));
     B.chest.add(mesh(geo.vest, mats.vest, true));
 
-    // Head sits on a real neck: the yoke below tops out at chest y 0.570 and
-    // the jaw starts at 0.631, so ~6 cm of throat is visible from every angle.
+    // Head sits on a real neck: the yoke tops out at chest y 0.570, the collar
+    // ring at 0.539, and the jaw starts at 0.653 — so 8 cm of throat is visible
+    // from every angle, with the helmet's chin strap crossing it.
     B.neck = new THREE.Group();
-    B.neck.position.y = 0.628;
+    B.neck.position.y = 0.652;
     B.chest.add(B.neck);
 
     B.head = new THREE.Group();
     B.neck.add(B.head);
     B.head.add(mesh(geo.head, mats.face, false));
-    B.head.add(mesh(geo.helmet, mats.camo, true));
+    // The helmet is gear, not uniform. Putting it on the dark tier costs
+    // nothing (it was already its own mesh) and buys the single clearest
+    // read on the figure: a dark head above light shoulders.
+    B.head.add(mesh(geo.helmet, mats.vest, true));
 
     for (const side of [-1, 1]) {
       const S = side < 0 ? 'L' : 'R';
@@ -695,8 +780,13 @@ export class Enemy {
       el.add(mesh(geo.foreArm, mats.camo, true));
       B['foreArm' + S] = el;
 
+      // Hips 2 cm wider each side. At 0.098 the thigh capsules (r 0.084) were
+      // 2.8 cm apart — the two legs read as one column and the figure had no
+      // base. At 0.118 there is a real gap of light between them, and negative
+      // space between the legs is one of the strongest "this is a person"
+      // signals the eye has.
       const hip = new THREE.Group();
-      hip.position.set(side * 0.098, 0, 0);
+      hip.position.set(side * 0.118, 0, 0);
       B.hips.add(hip);
       hip.add(mesh(geo.thigh, mats.camo, true));
       B['thigh' + S] = hip;
@@ -737,6 +827,14 @@ export class Enemy {
     this.shadow.updateMatrix();
     this._shadowScale = 1;
     this.root.add(this.shadow);
+
+    // Leg bones cached in order [L, R]. The pose loop used to index B by a
+    // concatenated name every frame, which allocates a string per joint per
+    // agent per tick; update() is not allowed to allocate.
+    this._legs = [
+      { thigh: B.thighL, shin: B.shinL, ankle: B.ankleL },
+      { thigh: B.thighR, shin: B.shinR, ankle: B.ankleR },
+    ];
 
     this.bones = B;
   }
@@ -791,7 +889,7 @@ export class Enemy {
 
     this.gait = this.rng() * TAU;
     this.moveAmt = 0; this.runAmt = 0;
-    this.aimW = 0; this.aimWTarget = 0; this.aimPose = 0;
+    this.aimW = 0; this.aimWTarget = 0; this.aimPose = 0; this.shoulder = 0;
     this.aimPitch = 0; this.aimYaw = 0;
     this.staggerX = this.staggerZ = this.staggerVX = this.staggerVZ = 0;
     this.recoil = 0;
@@ -1758,33 +1856,62 @@ export class Enemy {
     // boots sink through the floor at partial crouch weights.
     const crHip = 1.05 * cr;
     const crKnee = 2 * crHip;
-    const crDrop = 0.86 * (1 - Math.cos(crHip));
+
+    // --- fighting stance --------------------------------------------------
+    // A soldier who has stopped walking does not stand to attention. He stands
+    // with a wide base, weak-side foot forward, toes turned out, knees soft and
+    // his weight over the front foot. Heels together and bolt upright is the
+    // posture of a shop mannequin and it is the single cue that makes a figure
+    // read as a prop instead of a threat — worse, a symmetrical stick is also
+    // the least informative shape possible about which way somebody is facing.
+    // It fades out as the gait fades in, so this costs nothing while walking.
+    const st = (1 - m) * (1 - cr * 0.5) * live;
+    const stSplay = 0.125 * st;      // knees and toes turned out
+    const stStride = 0.155 * st;     // weak-side (left) foot forward
+    const stKnee = 0.27 * st;
+    const stHip = 0.10 * st;
+    // Lean at the ankles, not by folding the spine — the boots counter-rotate
+    // below so the soles stay flat on the ground.
+    const lean0 = (0.100 - 0.038 * aim) * st;
 
     // --- legs -------------------------------------------------------------
     const swing = (0.52 + run * 0.34) * m;
     const kneeAmp = (0.55 + run * 0.55) * m;
-    let lowestDrop = 0;
+    let lowestDrop = 0, holdLow = 0;
     for (let i = 0; i < 2; i++) {
-      const S = i === 0 ? 'L' : 'R';
+      const L = this._legs[i];
       const o = i === 0 ? 0 : Math.PI;
+      const out = i === 0 ? -1 : 1;
       const sp = Math.sin(ph + o);
-      const hipA = sp * swing + crHip + 0.04 * m;
+      const hipA = sp * swing + crHip + 0.04 * m + stHip + out * -stStride;
       // Knee only bends on the recovery half of the stride.
-      const bend = Math.max(0, -Math.sin(ph + o - 0.65)) * kneeAmp + 0.10 * m + crKnee;
+      const bend = Math.max(0, -Math.sin(ph + o - 0.65)) * kneeAmp + 0.10 * m + crKnee + stKnee;
       const ankA = THREE.MathUtils.clamp(-(hipA - bend) * 0.85, -0.65, 0.65)
                  + Math.max(0, Math.sin(ph + o + 0.9)) * 0.35 * m;
 
-      // How far this ankle sits below the hip pivot, for the planting pass.
-      const drop = 0.44 * Math.cos(hipA) + 0.42 * Math.cos(hipA - bend);
+      // How far this ankle sits below the hip pivot, for the planting pass —
+      // once for the live pose, and once with the gait terms taken back out.
+      // The second one is the *held* part of the pose (crouch plus stance),
+      // and it has to be compensated exactly rather than damped, because any
+      // error in a pose that is being held is permanent hover.
+      const drop = Math.cos(stSplay)
+        * (0.44 * Math.cos(hipA) + 0.42 * Math.cos(hipA - bend));
       if (drop > lowestDrop) lowestDrop = drop;
+
+      const hipH = crHip + stHip - out * stStride;
+      const bendH = crKnee + stKnee;
+      const dropH = Math.cos(stSplay)
+        * (0.44 * Math.cos(hipH) + 0.42 * Math.cos(hipH - bendH));
+      if (dropH > holdLow) holdLow = dropH;
 
       // Death targets stay close to straight: a dropped body is a roughly
       // planar shape, and folded limbs are what push knees through the floor.
       const li = i * 3;
-      B['thigh' + S].rotation.x = THREE.MathUtils.lerp(hipA, 0.12 + this.limp[li] * 0.45, dead);
-      B['thigh' + S].rotation.z = THREE.MathUtils.lerp(0, this.limp[li] * 0.35, dead);
-      B['shin' + S].rotation.x = THREE.MathUtils.lerp(-bend, -0.28 + this.limp[li + 1] * 0.4, dead);
-      B['ankle' + S].rotation.x = THREE.MathUtils.lerp(ankA, this.limp[li + 2] * 0.35, dead);
+      L.thigh.rotation.x = THREE.MathUtils.lerp(hipA, 0.12 + this.limp[li] * 0.45, dead);
+      L.thigh.rotation.z = THREE.MathUtils.lerp(out * stSplay, this.limp[li] * 0.35, dead);
+      L.shin.rotation.x = THREE.MathUtils.lerp(-bend, -0.28 + this.limp[li + 1] * 0.4, dead);
+      L.ankle.rotation.x = THREE.MathUtils.lerp(ankA - lean0, this.limp[li + 2] * 0.35, dead);
+      L.ankle.rotation.y = THREE.MathUtils.lerp(out * stSplay * 1.5, 0, dead);
     }
 
     // --- pelvis / body ----------------------------------------------------
@@ -1798,8 +1925,9 @@ export class Enemy {
     // (it is a held pose and any error is permanent); the striding part is
     // damped, standing in for the ankle roll and pelvic tilt this rig has no
     // joints for — at full extension it would otherwise pogo.
-    const gaitDrop = Math.max(0, (0.86 - lowestDrop) - crDrop);
-    const plant = crDrop + gaitDrop * 0.55;
+    const holdDrop = Math.max(0, 0.86 - holdLow);
+    const gaitDrop = Math.max(0, (0.86 - lowestDrop) - holdDrop);
+    const plant = holdDrop + gaitDrop * 0.55;
 
     // Once dead, lift as the body goes flat: the pivot is at the feet, not the
     // centre of mass, so a flat body would otherwise lie inside the floor.
@@ -1815,14 +1943,17 @@ export class Enemy {
       else _fallAxis.normalize();
       B.body.quaternion.setFromAxisAngle(_fallAxis, this.fallAngle * dead);
     } else {
-      B.body.rotation.set(0, 0, sway);
+      B.body.rotation.set(lean0, 0, sway);
     }
 
     B.hips.rotation.y = THREE.MathUtils.lerp(sinP * 0.11 * m, 0, dead);
     B.hips.rotation.x = THREE.MathUtils.lerp(0.03 * m + cr * 0.10, this.limp[6] * 0.2, dead);
 
     // --- chest: counter-rotate against the hips, then layer the aim in -----
-    const lean = (0.05 + run * 0.16) * m + cr * 0.20;
+    // Only half the ankle lean is given back at the chest, so the shoulders
+    // finish forward of the hips — that offset is what makes the stance read as
+    // braced rather than as a plank tipped over.
+    const lean = (0.05 + run * 0.16) * m + cr * 0.20 - lean0 * 0.5;
     const chestYaw = THREE.MathUtils.lerp(
       -sinP * 0.15 * m + this.aimYaw * aim, this.limp[6] * 0.4, dead);
     const chestPitch = THREE.MathUtils.lerp(
@@ -1838,7 +1969,8 @@ export class Enemy {
       this.limp[9] * 0.8, dead);
     B.head.rotation.y = headYaw;
     B.head.rotation.x = THREE.MathUtils.lerp(
-      -chestPitch * 0.75 + this.aimPitch * aim * 0.4 + Math.sin(ph * 2) * 0.012 * m,
+      -chestPitch * 0.75 - lean0 * 0.55 + this.aimPitch * aim * 0.4
+        + Math.sin(ph * 2) * 0.012 * m,
       0.22 + this.limp[10] * 0.35, dead);
     B.head.rotation.z = THREE.MathUtils.lerp(-sway * 0.6, this.limp[11] * 0.5, dead);
 
@@ -1849,7 +1981,18 @@ export class Enemy {
     // silhouette is a civilian. There is now exactly one live pose family, and
     // `aimPose` fades it between low ready and shouldered. Both ends are
     // solved so the hands land on the weapon rather than near it.
-    this.aimPose = approach(this.aimPose, this.aimWTarget > 0.9 ? 1 : 0, 4.0, dt);
+    // Weapon comes up to fire and settles back to the ready carry afterwards.
+    // This is the other half of the silhouette problem: a rifle shouldered and
+    // pointed at the camera is, by construction, a shape with no width — no
+    // pose work can rescue it. An agent who shoulders only when he is about to
+    // shoot spends most of his time in the READY carry instead, which is 0.64 m
+    // of weapon straight across the torso, and the moment he does come up is
+    // now a telegraph the player can act on. `windUp` fires 0.26-0.42 s before
+    // the first round, so he is fully shouldered by the time it leaves.
+    if (this.burstLeft > 0 || this.windUp > 0 || this.recoil > 0.06) this.shoulder = 1.25;
+    else this.shoulder = Math.max(0, this.shoulder - dt);
+    const wantAim = this.aimWTarget > 0.9 && (this.shoulder > 0 || this.distToPlayer < 7);
+    this.aimPose = approach(this.aimPose, wantAim ? 1 : 0, 6.5, dt);
     const ap = this.aimPose;
     // A little residual gait in the shoulders so the carry is not rigid.
     const armBob = sinP * 0.055 * m * (1 - ap * 0.55);
@@ -1953,24 +2096,38 @@ export class Enemy {
  * the weapon instead of hovering beside it. Change a mount number and these
  * must be re-solved, or the grip drifts.
  *
- * READY is a low ready: the muzzle drops ~27 deg and swings across the body,
- * which puts a long diagonal in the silhouette from any viewing angle — that
- * diagonal is the only thing telling a player at 20 m that this figure is
- * armed. AIM shoulders the weapon square with the chest so the bore lies on
- * the chest's -Z axis; pointing the chest at the target points the gun.
+ * READY is the pose that carries the whole thing, because a hostile who is not
+ * currently shouldered is what the player sees most of the time — and the
+ * previous version failed exactly here. Its weapon yawed only 17 deg across
+ * the body, so an enemy facing you presented a rifle foreshortened to a stub
+ * of about 12 cm: entirely inside a torso half-width of 25 cm, i.e. invisible
+ * in silhouette at any range. This one is a stock-in-the-shoulder low ready
+ * swung 41 deg across and 17 deg down. The muzzle now sits at chest x -0.348
+ * and the buttpad at +0.290 — a 0.64 m horizontal bar straight through the
+ * torso outline, roughly 40 px of weapon at 12 m, sticking well clear of the
+ * body on both sides no matter which way the agent is facing.
+ *
+ * AIM still shoulders the weapon square with the chest so the bore lies on the
+ * chest's -Z axis (pointing the chest at the target points the gun). A rifle
+ * aimed at you is foreshortened by definition, so the silhouette work there is
+ * done by the arms instead. The firing elbow is driven out to chest x +0.41 and
+ * held high (y 0.420) while the support elbow drops to y 0.368 — both because
+ * that is what a real shooter looks like from the front, and because two
+ * elbows at the same height read as a scarecrow crossbar, which is the one
+ * shape the eye will not accept as a man pointing a rifle at it.
  */
 const GRIP_READY = {
-  l: [0.585, -0.702, 0.034, 1.247, 0.22],
-  r: [-0.394, 0.769, 0.660, 2.540, -0.30],
-  p: [0.085, 0.405, -0.150],
-  rot: [-0.48, 0.30, 0.05],
+  l: [0.409, -0.790, -0.444, 1.515, 0.22],
+  r: [-0.290, 0.581, 0.968, 2.483, -0.30],
+  p: [0.115, 0.415, -0.185],
+  rot: [-0.30, 0.72, 0.06],
 };
 
 const GRIP_AIM = {
-  l: [1.310, -0.454, 0.349, 0.762, 0.26],
-  r: [0.174, 0.877, 0.629, 2.343, -0.34],
-  p: [0.055, 0.470, -0.205],
-  rot: [0, 0, 0],
+  l: [1.459, -0.557, 0.508, 0.602, 0.26],
+  r: [-0.404, 0.713, 1.661, 2.501, -0.34],
+  p: [0.118, 0.438, -0.178],
+  rot: [0, 0, -0.10],
 };
 
 /** Sidestep angles tried when the grid says the way ahead is blocked. */
