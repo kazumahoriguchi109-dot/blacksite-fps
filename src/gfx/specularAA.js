@@ -133,9 +133,52 @@ export function upgradeSceneMaterials(root, renderer, o = {}) {
  */
 const DESATURATED = new WeakSet();
 
-export function desaturateMaterial(mat, saturation = 0.68) {
+/*
+ * The colour script proper.
+ *
+ * A flat saturation multiply is not a colour script — applied uniformly it
+ * flattened one frame into "a monochrome sand frame with no hue variation and
+ * no value separation between foreground crate, mid-ground containers and
+ * background building", i.e. no focal point at all.
+ *
+ * A colour script is a value-and-hue PLAN. This one is:
+ *   ground        dark, near-neutral        — reads as the floor, never competes
+ *   architecture  mid value, slight warm    — the bulk of the frame
+ *   industrial    lower value, cool-neutral — metal recedes behind architecture
+ *   organic       mid-warm, more hue left   — wood/fabric carry the warmth
+ *   accent        untouched                 — the ONE saturated family, reserved
+ *                                             for hazard marking the eye should
+ *                                             actually go to
+ *
+ * `value` multiplies luminance so the plan controls tonal layering, not just
+ * chroma; that is what restores separation between depth planes.
+ */
+const COLOUR_SCRIPT = [
+  { test: /^(asphalt|gravel|dirt|rubber)/,                     saturation: 0.46, value: 0.94 },
+  { test: /(warning_stripe|road_marking|hazard)/,              saturation: 1.00, value: 1.00 },
+  { test: /^(concrete|brick|plaster|rebar|tile)/,              saturation: 0.74, value: 1.00 },
+  { test: /(metal|steel|corrugated|grate|chainlink|sheet)/,    saturation: 0.52, value: 0.94 },
+  { test: /^(wood|sandbag|tarp|camo)/,                         saturation: 0.80, value: 1.02 },
+  { test: /glass/,                                             saturation: 0.66, value: 1.00 },
+];
+const COLOUR_DEFAULT = { saturation: 0.66, value: 0.98 };
+
+/** Look up a material's place in the colour script by name. */
+export function colourScriptFor(name = '') {
+  for (const rule of COLOUR_SCRIPT) if (rule.test.test(name)) return rule;
+  return COLOUR_DEFAULT;
+}
+
+export function desaturateMaterial(mat, opts = {}) {
   if (!mat || DESATURATED.has(mat) || !mat.isMeshStandardMaterial) return mat;
-  const sat = saturation.toFixed(3);
+  const plan = typeof opts === 'number'
+    ? { saturation: opts, value: 1 }
+    : { ...colourScriptFor(mat.name ?? ''), ...opts };
+  const sat = plan.saturation.toFixed(3);
+  const val = (plan.value ?? 1).toFixed(3);
+  // An untouched material needs no injection at all.
+  if (plan.saturation >= 0.999 && (plan.value ?? 1) === 1) { DESATURATED.add(mat); return mat; }
+
   const prev = mat.onBeforeCompile;
   mat.onBeforeCompile = (shader, renderer) => {
     prev?.(shader, renderer);
@@ -146,27 +189,32 @@ export function desaturateMaterial(mat, saturation = 0.68) {
       {
         // ENV_DESAT
         float envLum = dot( diffuseColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );
-        diffuseColor.rgb = mix( vec3( envLum ), diffuseColor.rgb, ${sat} );
+        diffuseColor.rgb = mix( vec3( envLum ), diffuseColor.rgb, ${sat} ) * ${val};
       }`
     );
   };
   const baseKey = mat.customProgramCacheKey?.bind(mat);
-  mat.customProgramCacheKey = () => `${baseKey ? baseKey() : ''}|desat${sat}`;
+  mat.customProgramCacheKey = () => `${baseKey ? baseKey() : ''}|cs${sat}_${val}`;
   mat.needsUpdate = true;
   DESATURATED.add(mat);
   return mat;
 }
 
 /** Apply the colour script to an object tree (typically the level root). */
-export function desaturateWorld(root, saturation = 0.68) {
+export function desaturateWorld(root) {
   let n = 0;
+  const byPlan = {};
   root.traverse((obj) => {
     const m = obj.material;
     if (!m) return;
     for (const mat of Array.isArray(m) ? m : [m]) {
-      if (!DESATURATED.has(mat) && mat.isMeshStandardMaterial) n++;
-      desaturateMaterial(mat, saturation);
+      if (DESATURATED.has(mat) || !mat.isMeshStandardMaterial) continue;
+      const plan = colourScriptFor(mat.name ?? '');
+      const key = `${plan.saturation}/${plan.value}`;
+      byPlan[key] = (byPlan[key] ?? 0) + 1;
+      desaturateMaterial(mat);
+      n++;
     }
   });
-  return n;
+  return { count: n, byPlan };
 }

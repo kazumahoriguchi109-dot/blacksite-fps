@@ -283,8 +283,8 @@ async function boot() {
   // Colour script: pull the environment's saturation down so the map reads as
   // one place rather than an asset-pack dump. Characters and the viewmodel are
   // deliberately excluded — they need to stay separated from the terrain.
-  const desatCount = desaturateWorld(world.root, 0.66);
-  console.info(`[gfx] colour script applied to ${desatCount} world materials`);
+  const cs = desaturateWorld(world.root);
+  console.info(`[gfx] colour script: ${cs.count} materials`, cs.byPlan);
 
   /*
    * Interior lighting attenuation.
