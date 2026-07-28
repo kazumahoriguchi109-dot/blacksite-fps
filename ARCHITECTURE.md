@@ -223,6 +223,26 @@ Adaptive resolution (`ctx.drs`) trades internal resolution between 0.62x and
 dropped framerate. If `ctx.drs.scale` is pinned at its floor, the frame is too
 expensive — check `stats.json` rather than trusting the framerate.
 
+**Lighting ownership.** `Sky` writes `scene.environmentIntensity` and the
+hemisphere intensity only in `applyParams()` / `_deriveLighting()` /
+`_renderEnv()`, and `_renderEnv()` only fires when the sun moves past a
+threshold. With a fixed time of day that is *never*. So anything that wants to
+modulate them must **assign from a cached base**, never `*=` the live value —
+a per-frame multiply compounds to zero. `main.js`'s interior attenuation shows
+the pattern: cache, re-adopt if someone else writes, assign.
+
+**Practical lights** are boosted 4.2x at adoption in `main.js`. They were
+authored when a bright sky IBL lit everything uniformly and they only had to be
+a hint; with interiors attenuating that IBL and auto-exposure lifting the room,
+an unboosted fixture is ~5% of what the eye has adapted to. Reach scales with
+intensity or the pool clips into a hard circle.
+
+**Colour script.** `desaturateWorld()` applies a per-class value-and-hue plan,
+not a flat saturation multiply — ground near-neutral and slightly darker,
+architecture mid, industrial cooler and lower, organic warmer, and hazard
+marking left fully saturated as the single reserved accent. Characters and the
+viewmodel are deliberately excluded so they stay separated from the terrain.
+
 **Boot time.** Every texture is generated synchronously in the browser. The
 catalogue is preloaded via `preloadMaterialsAsync` at 320 px so the loading bar
 can paint. Boot is ~11 s; treat anything over ~25 s as a regression.
@@ -231,6 +251,31 @@ can paint. Boot is ~11 s; treat anything over ~25 s as a regression.
 
 See `REVIEW.md`. `scripts/capture.mjs` (with `--whitebox`), `playtest.mjs`,
 `profile.mjs`, `keyfill.mjs`, `boottime.mjs`, `overview.mjs`, `enemyshot.mjs`.
+
+## The review instrument
+
+`scripts/capture.mjs` is the measuring device for every visual judgement, and
+**it has been wrong five separate times**, each of which silently invalidated a
+round of review findings. If a result looks strange, suspect the tool first.
+
+Rules it now enforces, and why:
+- **`pos[1]` is FOOT height, not eye height.** Poses that carried an eye height
+  started the player in mid-air to fall onto whatever was beneath.
+  `04_warehouse_int` landed on top of a storage rack *outside* the building, so
+  every "warehouse interior" frame in four review rounds was a courtyard shot.
+- Every capture prints its achieved eye height and warns **EJECTED** when
+  collision has displaced the player from the requested pose. Trust that warning.
+- Poses declare a **stance** (`crouch: true`), because an arbitrary eye height
+  is not reachable — a crouched eye is 1.02 m and a standing eye 1.63 m.
+- No per-pose `fov`. The game runs at 60 vertical; overriding it meant reviews
+  judged frames the player never sees.
+- `--whitebox` must skip the sky dome. It is a BackSide `ShaderMaterial`;
+  replacing it with a FrontSide standard material culls it to nothing and leaves
+  the blurred PMREM background in its place.
+- The run **hard-fails if any subsystem is stubbed**, because a failed dynamic
+  import degrades to a stub with only a `console.warn`.
+- Auto-exposure is snapped per pose. It converges over 1-3 s; a short settle
+  left every frame mid-adaptation and made each pose depend on the previous one.
 
 ## Quality bar
 
