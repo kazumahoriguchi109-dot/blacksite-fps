@@ -1,6 +1,8 @@
 # STATUS — save point
 
 Last saved: 2026-07-28. The build is playable and healthy at this commit.
+Save points: `playable-v1` (first playable), `playable-v2` (AO + budget),
+`playable-v3` (clouds rebuilt) — current.
 
 ## Resume in one minute
 
@@ -24,9 +26,9 @@ node scripts/boottime.mjs      # expect ~11 s
 
 **Measured at this save point**
 - 36/36 automated gameplay checks pass
-- Boots in 11.4 s
-- 60 fps in combat with 5 enemies · 42–45 fps typical · 25 fps worst observed
-- 753 draw calls, 1.15 M triangles in a wide establishing view
+- Boots in 11.0 s
+- 46–60 fps in combat with 5 enemies
+- **402 draw calls** (budget 450), 1.27 M triangles in a wide establishing view
 - Key-to-fill 2.9–3.3 stops, shadow blue/red 1.08–1.43
 - White clipping < 0.25%, black clipping < 6% in every heading
 
@@ -49,13 +51,15 @@ nav grid, procedural WebAudio, wave-based game mode with respawn.
 
 ## What is NOT done — ranked, from the fourth review
 
-1. **Clouds regressed into a regular lattice** of identically-sized, identically
-   -slanted lozenges. `src/world/Sky.js`. Suspected: `cloudShear` 0.55 over a
-   2.70 km slab extrudes each weather cell into a slanted cylinder seen end-on.
-   Suggested: shear → ~0.15, thickness → ~1.2 km, add a low-frequency amplitude
-   mask so cells vary 3–4× in size, blue-noise the march start.
-2. **Draw-call budget blown**: 753 vs a 450 budget, 1.15 M vs 900 k triangles.
-   `src/world/Level.js`, `src/world/Props.js`, `src/world/Builder.js`.
+1. **Clouds share a family resemblance** at mid distance — rounded, flat-based
+   puffs of similar proportion. No lattice and no countable rhythm any more, but
+   a viewer could say "all the small clouds are the same kind of cloud". Cause:
+   the 3D erosion volume is a fixed world size (465 m coarsest lobe), so a 900 m
+   puff gets barely one lobe across it. A proper fix needs a second volume fetch
+   at a cloud-size-dependent scale, which does not fit at performance parity.
+   Cloud march stipple is reduced, not eliminated — visible pixel-peeped at 3x.
+2. **Triangles still above target**: 1.27 M vs a 900 k goal (draw calls are now
+   under budget). `src/world/Level.js`, `src/world/Props.js`.
 3. **Enemies still weak at 12 m** — rifle not reading in silhouette, contact
    shadow too faint, camo too high-frequency. `src/ai/Enemy.js`.
 4. **Viewmodel hip pose oversized**; support hand grips the top of the rail
