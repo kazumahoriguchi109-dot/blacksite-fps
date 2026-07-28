@@ -244,6 +244,43 @@ export class Builder {
     const group = new THREE.Group();
     group.name = 'level';
 
+    /*
+     * Coalesce undersized chunks before emitting meshes.
+     *
+     * Chunking by material AND 22 m cell restored frustum culling, but it also
+     * produced a long tail of near-empty chunks: measured 340 of 541 level
+     * meshes held under 800 triangles, and 267 held under 400. A chunk that
+     * small costs a full draw call and saves almost nothing, because drawing a
+     * few hundred triangles is free — the call itself is the cost.
+     *
+     * So anything below the threshold is re-keyed onto a 4x coarser grid
+     * (88 m). That keeps coarse culling for the clutter while collapsing the
+     * tail, instead of dumping it all into one unculled per-material mesh.
+     */
+    const SMALL_CHUNK_TRIS = 2400;
+    const COARSE = 4;
+    const coalesced = new Map();
+    for (const [key, bucket] of this.buckets) {
+      if (!bucket.geoms.length) continue;
+      let tris = 0;
+      for (const g of bucket.geoms) tris += g.attributes.position.count / 3;
+      const hash = key.indexOf('#');
+      const cell = key.slice(hash + 1);
+      let outKey = key;
+      if (tris < SMALL_CHUNK_TRIS && cell !== 'big') {
+        const [cx, cz] = cell.split('_').map(Number);
+        if (Number.isFinite(cx) && Number.isFinite(cz)) {
+          outKey = `${bucket.mat}#c${Math.floor(cx / COARSE)}_${Math.floor(cz / COARSE)}`;
+        }
+      }
+      const dst = coalesced.get(outKey);
+      if (dst) dst.geoms.push(...bucket.geoms);
+      else coalesced.set(outKey, { geoms: [...bucket.geoms], surface: bucket.surface, mat: bucket.mat });
+    }
+    const before = this.buckets.size;
+    this.buckets = coalesced;
+    console.info(`[Builder] coalesced ${before} -> ${coalesced.size} chunks`);
+
     let meshCount = 0, triCount = 0;
     for (const [key, bucket] of this.buckets) {
       if (!bucket.geoms.length) continue;

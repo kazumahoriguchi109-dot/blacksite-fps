@@ -177,63 +177,200 @@ function _worley3(N, C, rng) {
 
 /**
  * WEATHER map — 512^2 RGBA8, seamless; one tile = cloudCellKm * weatherCells.
- *   R  coverage field, large cells   (congestus scale)
- *   G  coverage field, small cells   (fair-weather puff scale)
- *   B  region field: which of the two dominates + a coverage bias
- *   A  condensation-level wobble; also the domain-warp partner of B
- * R and G are two independent fbms of different cell size. Blending between
- * them with the slow B field is what gives SCALE VARIATION — one quarter of the
- * sky carrying 2 km towers and another carrying 1 km puffs — for no extra fetch.
+ *   R  coverage   — the union of every cloud's footprint: 1 in a core, 0 outside
+ *   G  tower      — how far up the slab THIS cloud builds     (per-cloud constant)
+ *   B  base       — THIS cloud's condensation level           (per-cloud constant)
+ *   A  character  — THIS cloud's density / erosion multiplier (per-cloud constant)
+ *
+ * This map is SPLATTED, not thresholded out of an fbm, and that is the whole
+ * fix for the lattice.
+ *
+ * A value-noise fbm lives on an axis-aligned periodic lattice. With the base
+ * octave carrying half the amplitude (it has to, or the field has no cells at
+ * all) the field is a grid of bumps with wiggle on top, and a narrow threshold
+ * against a grid of bumps returns a grid of blobs — one blob per lattice cell,
+ * spaced exactly one cell apart, all within a factor of ~1.3 in size because
+ * they are all the same bump cut at the same height. That is precisely the "row
+ * of seven identical lozenges" the review counted, and no amount of domain warp
+ * fixes it: a warp of 2 km translates a whole neighbourhood, it does not change
+ * the spacing inside one.
+ *
+ * So clouds are placed as OBJECTS instead. Each is a cluster of 2-5 rotated
+ * elliptical lobes, composited by max, with:
+ *   - a radius drawn from a heavy-tailed distribution spanning ~7x,
+ *   - a position drawn from a rejection sample against a low-frequency airmass
+ *     field, so the field has busy banks and clear lanes rather than uniform
+ *     scatter,
+ *   - its own tower height (correlated with its radius, as convection is),
+ *   - its own condensation level, so bases are flat PER CLOUD and staggered,
+ *   - its own density/erosion character.
+ * There is no lattice anywhere in that, and no two clouds share a shape, a
+ * size, a height or a base.
+ *
+ * The per-cloud channels are written by the same max test that builds coverage,
+ * so they are piecewise constant over each cloud with the seams buried where
+ * two clouds already overlap; a short blur turns those seams into a 150 m ramp.
  */
-function buildWeatherTexture(size) {
+function buildWeatherTexture(size, cfg) {
   const rng = makeRng(0x51ce7a1);
   const N = size;
-  const data = new Uint8Array(N * N * 4);
+  const NN = N * N;
+  const data = new Uint8Array(NN * 4);
 
-  const mk = (cells, oct, rngRef) => {
-    const ls = [];
-    for (let o = 0; o < oct; o++) ls.push({ C: cells << o, g: _lattice2(cells << o, rngRef) });
-    return ls;
-  };
-  const fbm = (ls, amps, x, y) => {
-    let s = 0, w = 0;
-    for (let o = 0; o < ls.length; o++) { s += amps[o] * _val2(ls[o].g, ls[o].C, x, y); w += amps[o]; }
-    return s / w;
-  };
+  const tileKm = Math.max(cfg.tileKm, 4.0);
+  const texPerKm = N / tileKm;
 
-  const AMP = [0.52, 0.26, 0.14, 0.08];
-  const chans = [
-    mk(13, 4, rng),   // R: 13 cells across the tile — congestus scale
-    mk(19, 4, rng),   // G: ~1.5x finer — fair-weather puffs. Not finer than
-                      // that: the erosion below chews ~300 m off every edge,
-                      // and a 0.9 km cell does not survive it as a cloud, only
-                      // as a wisp.
-    mk(3, 2, rng),    // B: region — which of the two dominates
-    mk(5, 2, rng),    // A: condensation-level wobble + warp partner
-  ];
+  // cov doubles as the dominance key for the three per-cloud channels.
+  const cov = new Float32Array(NN);
+  const tow = new Float32Array(NN).fill(0.55);
+  const bas = new Float32Array(NN).fill(0.50);
+  const chr = new Float32Array(NN).fill(0.55);
 
-  // A summed fbm clusters hard around 0.5, so a threshold picked against it is
-  // a knife edge: 0.60 selects a fifth of the sky and 0.80 selects none of it,
-  // which is exactly how the first pass came out as a dozen lonely puffs.
-  // Stretching each channel to its own full range makes cloudCoverage mean what
-  // it says — 0.5 really is half the sky — and gives the flanks somewhere to go.
-  const buf = new Float32Array(N * N);
-  for (let c = 0; c < 4; c++) {
-    let lo = Infinity, hi = -Infinity;
-    for (let y = 0; y < N; y++) {
-      const v = (y + 0.5) / N;
-      for (let x = 0; x < N; x++) {
-        const s = fbm(chans[c], AMP, (x + 0.5) / N, v);
-        buf[y * N + x] = s;
-        if (s < lo) lo = s;
-        if (s > hi) hi = s;
+  // --- airmass -------------------------------------------------------------
+  // Where convection is active at all. Three very low octaves (2 / 4 / 7 cells
+  // over the whole tile, so 3.5-13 km) used two ways: as a rejection field for
+  // cloud placement, and as a multiplier on cloud size. This is what gives the
+  // sky composition — banks of big clouds, lanes of small ones, and holes —
+  // rather than the featureless even scatter a stationary Poisson process makes.
+  const a2 = _lattice2(2, rng), a4 = _lattice2(4, rng), a7 = _lattice2(7, rng);
+  const airAt = (x, y) => 0.50 * _val2(a2, 2, x, y)
+                        + 0.32 * _val2(a4, 4, x, y)
+                        + 0.18 * _val2(a7, 7, x, y);
+
+  // --- cloud population ----------------------------------------------------
+  const rMin = Math.max(cfg.radiusMinKm, 0.10) * texPerKm;
+  const rMax = Math.max(cfg.radiusMaxKm, cfg.radiusMinKm * 1.5) * texPerKm;
+  const ratio = rMax / rMin;
+  const logRatio = Math.log(ratio);
+  const budget = Math.max(cfg.areaBudget, 0.05) * NN;
+  const scatter = Math.max(cfg.lobeScatter, 0.0);
+
+  let area = 0, guard = 0, clouds = 0;
+  while (area < budget && guard++ < 40000) {
+    const cx = rng() * N, cy = rng() * N;
+    const air = airAt(cx / N, cy / N);
+    // Rejection sample. Below ~0.32 of the airmass field nothing forms; the
+    // ramp above it means the transition from clear lane to cloud bank is a
+    // gradient in cloud DENSITY, which is how a real field thins out.
+    const p = Math.min(1, Math.max(0, (air - 0.32) / 0.40));
+    if (rng() > _smooth(p)) continue;
+
+    // Heavy tail: cubing the uniform puts ~2/3 of the population in the bottom
+    // fifth of the size range and leaves a thin tail of genuine congestus. A
+    // linear draw gives a sky where every cloud is mid-sized, which reads as
+    // uniform even though it technically varies.
+    const u = rng();
+    const r = Math.min(rMax, rMin * Math.pow(ratio, u * u * u) * (0.70 + 0.62 * air));
+    const sizeN = Math.min(1, Math.max(0, Math.log(r / rMin) / logRatio));
+
+    area += Math.PI * r * r;
+    clouds++;
+
+    // Vertical development tracks width — a wide cumulus is a deep one — but
+    // loosely, so two clouds of the same width still differ in height.
+    const towV = Math.min(1, Math.max(0.04,
+      0.14 + 0.82 * Math.pow(sizeN, 0.70) + (rng() - 0.5) * 0.30));
+    const basV = rng();
+    const chrV = 0.16 + 0.80 * rng();
+    const amp = 0.74 + 0.26 * rng();
+
+    const lobes = 2 + (rng() * 4) | 0;
+    for (let l = 0; l < lobes; l++) {
+      const lr = r * (0.44 + 0.54 * rng());
+      const off = (r - lr) * scatter * Math.sqrt(rng());
+      const oa = rng() * Math.PI * 2;
+      const lx = cx + Math.cos(oa) * off;
+      const ly = cy + Math.sin(oa) * off;
+
+      const asp = 0.62 + 0.80 * rng();
+      const rot = rng() * Math.PI;
+      const ca = Math.cos(rot), sa = Math.sin(rot);
+      const ax = lr, ay = lr * asp;
+      const invAx = 1 / (ax * ax), invAy = 1 / (ay * ay);
+      const ext = Math.max(ax, ay) + 2;
+
+      const iy0 = Math.floor(ly - ext), iy1 = Math.ceil(ly + ext);
+      const ix0 = Math.floor(lx - ext), ix1 = Math.ceil(lx + ext);
+      for (let y = iy0; y <= iy1; y++) {
+        const dy = y + 0.5 - ly;
+        const row = ((((y % N) + N) % N)) * N;
+        for (let x = ix0; x <= ix1; x++) {
+          const dx = x + 0.5 - lx;
+          const px = ca * dx + sa * dy;
+          const py = -sa * dx + ca * dy;
+          const u2 = px * px * invAx + py * py * invAy;
+          if (u2 >= 1) continue;
+          // Flat-topped: full value inside 0.32 of the lobe, then a smooth
+          // shoulder to zero. A cone-shaped splat thresholds into a circle
+          // whose radius is a linear function of the threshold, which makes
+          // cloudCoverage a size knob instead of a coverage knob.
+          const q = u2 <= 0.10 ? 0.0 : (u2 - 0.10) * 1.111111;
+          const s = amp * (1.0 - q * q * (3.0 - 2.0 * q));
+          const i = row + ((((x % N) + N) % N));
+          if (s > cov[i]) { cov[i] = s; tow[i] = towV; bas[i] = basV; chr[i] = chrV; }
+        }
       }
     }
-    const inv = 1 / Math.max(hi - lo, 1e-6);
-    for (let i = 0; i < N * N; i++) {
-      data[i * 4 + c] = Math.max(0, Math.min(255, Math.round((buf[i] - lo) * inv * 255)));
+  }
+
+  // --- outline break -------------------------------------------------------
+  // A multiplicative modulation at 1.2 / 0.6 / 0.3 km. This does NOT generate
+  // shape — it only wobbles the level set — so it cannot re-impose a lattice of
+  // blobs; what it does is stop the thresholded outline from being a smooth
+  // ellipse at the 500 m band the 3D erosion volume (which starts at ~620 m and
+  // is identical for every cloud) does not cover.
+  {
+    const c0 = Math.max(4, Math.round(tileKm / 1.20));
+    const g0 = _lattice2(c0, rng), g1 = _lattice2(c0 * 2, rng), g2 = _lattice2(c0 * 4, rng);
+    for (let y = 0; y < N; y++) {
+      const v = (y + 0.5) / N, row = y * N;
+      for (let x = 0; x < N; x++) {
+        if (cov[row + x] <= 0.0) continue;
+        const uu = (x + 0.5) / N;
+        const f = 0.55 * _val2(g0, c0, uu, v)
+                + 0.30 * _val2(g1, c0 * 2, uu, v)
+                + 0.15 * _val2(g2, c0 * 4, uu, v);
+        cov[row + x] *= 0.86 + 0.30 * f;
+      }
     }
   }
+
+  // --- soften the per-cloud channel seams ----------------------------------
+  // Separable wrapping box blur, radius 3 texels (~150 m). The coverage channel
+  // is deliberately NOT blurred: it carries the silhouette.
+  {
+    const R = 3, W = 2 * R + 1, invW = 1 / W;
+    const tmp = new Float32Array(NN);
+    const blur = (buf) => {
+      for (let y = 0; y < N; y++) {
+        const row = y * N;
+        let acc = 0;
+        for (let k = -R; k <= R; k++) acc += buf[row + (((k % N) + N) % N)];
+        for (let x = 0; x < N; x++) {
+          tmp[row + x] = acc * invW;
+          acc += buf[row + ((x + R + 1) % N)] - buf[row + ((x - R + N) % N)];
+        }
+      }
+      for (let x = 0; x < N; x++) {
+        let acc = 0;
+        for (let k = -R; k <= R; k++) acc += tmp[(((k % N) + N) % N) * N + x];
+        for (let y = 0; y < N; y++) {
+          buf[y * N + x] = acc * invW;
+          acc += tmp[((y + R + 1) % N) * N + x] - tmp[((y - R + N) % N) * N + x];
+        }
+      }
+    };
+    blur(tow); blur(bas); blur(chr);
+  }
+
+  for (let i = 0; i < NN; i++) {
+    const o = i * 4;
+    data[o]     = Math.max(0, Math.min(255, Math.round(cov[i] * 255)));
+    data[o + 1] = Math.max(0, Math.min(255, Math.round(tow[i] * 255)));
+    data[o + 2] = Math.max(0, Math.min(255, Math.round(bas[i] * 255)));
+    data[o + 3] = Math.max(0, Math.min(255, Math.round(chr[i] * 255)));
+  }
+  buildWeatherTexture.lastCount = clouds;
 
   const tex = new THREE.DataTexture(data, N, N, THREE.RGBAFormat, THREE.UnsignedByteType);
   tex.wrapS = THREE.RepeatWrapping;
@@ -513,7 +650,7 @@ ${ATMO_COMMON}
   uniform float uTime;
   uniform float uStarStrength;
 
-  uniform sampler2D uWeather;      // RGBA: covBig, covSmall, region, baseLevel
+  uniform sampler2D uWeather;      // RGBA: coverage, tower, base, character
   uniform sampler3D uNoiseVol;     // RGBA: valueFbm, worley3, worley6, worley12
 
   uniform vec3  uCloudSunColor;
@@ -523,11 +660,12 @@ ${ATMO_COMMON}
   uniform float uCloudThick;       // slab thickness, km
   uniform float uInvThick;         // 1 / uCloudThick
   uniform float uWeatherScale;     // 1/km — weather tile is 1/uWeatherScale km
-  uniform float uWeatherWarp;      // domain-warp amplitude, weather-tile units
   uniform float uVolScale;         // 1/km — volume tile is 1/uVolScale km
   uniform float uCloudVert;        // km the volume's Y axis spans over the slab
-  uniform float uCloudTowerMin;    // slab fraction a thin cell reaches
-  uniform float uCloudTowerMax;    // slab fraction a solid cell reaches
+  uniform float uCloudTowerMin;    // slab fraction the shallowest cloud reaches
+  uniform float uCloudTowerMax;    // slab fraction the deepest cloud reaches
+  uniform float uCloudBaseLo;      // slab fraction of the lowest condensation level
+  uniform float uCloudBaseSpan;    // slab fraction the condensation level ranges over
   uniform float uCloudThreshold;
   uniform float uCloudOpacity;     // final alpha multiplier
   uniform float uCloudDensity;     // extinction per km at full density
@@ -628,85 +766,72 @@ ${ATMO_COMMON}
     return q + uCloudWind * (h * uCloudShear);
   }
 
-  // The warp/region fetch, taken ONCE per ray. It is sampled at 0.53x the
-  // coverage frequency, so its period is ~47 km and it changes by nothing at
-  // all across the ~5 km chord a ray takes through the deck. Hoisting it out of
-  // the march halves the texture traffic of the whole shader, and that is what
-  // pays for the step count the deck actually needs.
-  vec4 cloudRegion(vec2 q){
-    return texture2D(uWeather, q * (uWeatherScale * 0.53) + vec2(0.37, 0.11));
+  // One fetch, four per-cloud facts. Returns
+  //   x  cf     coverage after thresholding — the horizontal silhouette
+  //   y  baseH  THIS cloud's condensation level, slab fraction
+  //   z  tower  how far up the slab THIS cloud builds AT THIS POINT
+  //   w  chr    THIS cloud's character: density and erosion multiplier
+  //
+  // Everything that used to be derived from the coverage value itself — how
+  // tall the cell is, where its base sits — is now a property of the cloud
+  // baked into its own channel, and that is what breaks the "identical
+  // lozenge" reading. When tower = f(coverage) and coverage is near-binary,
+  // every cloud in the sky is exactly the same height and exactly the same
+  // vertical profile, so they differ only in outline; the eye reads seven
+  // copies. Read from the map, tower spans 5x across the population and is
+  // uncorrelated with the outline.
+  vec4 cloudWeather(vec2 q){
+    vec4 W = texture2D(uWeather, q * uWeatherScale);
+    float thr = uCloudThreshold;
+
+    // The ramp is WIDE, and that is deliberate — it is the opposite of what the
+    // fbm version needed and it took a render to see why. A splat falloff is
+    // steep in space: the whole 1 -> 0 shoulder occupies the outer third of the
+    // radius. Threshold it with the narrow ramp an fbm wanted and the partial-
+    // density band is ~7% of the cloud's width, so the erosion below — which
+    // can only move the level set, not invent one — has nowhere to bite, and
+    // every cloud comes back a smooth river pebble with a clean elliptical
+    // outline. A wide ramp hands the erosion a band a third of the cloud wide
+    // to carve, and the erosion is what puts the hard, complex edge back.
+    float cf = smoothstep(thr, thr + 0.26, W.r);
+
+    // A second, wider ramp off the same fetch: 0 at the perimeter, 1 in the
+    // core. This is the crown profile. Without it a per-cloud tower height
+    // gives every cloud a flat top at its own altitude — a field of mesas —
+    // because the height no longer falls off toward the flanks. Weighted only
+    // 0.40, though: at 0.62 the height fell away so fast from the core that the
+    // result was a smooth dome, and a cumulus flank is nearly vertical.
+    float dome = smoothstep(thr, thr + 0.42, W.r);
+
+    return vec4(cf,
+                uCloudBaseLo + uCloudBaseSpan * W.b,
+                mix(uCloudTowerMin, uCloudTowerMax, W.g) * (0.60 + 0.40 * dome),
+                W.a);
   }
 
-  void cloudWeather(vec2 q, vec4 lo, out float cf, out float baseH, out float tower){
-    // Domain warp. The region fetch's own low-frequency channels are the warp
-    // vector, so it costs nothing extra, and it is what stops the coverage
-    // lattice from reading as the row of identical repeated pebbles the review
-    // found along the horizon: cell outlines wander instead of sitting on a grid.
-    vec2 warp = (lo.ba - vec2(0.5)) * uWeatherWarp;
-    vec4 W = texture2D(uWeather, q * uWeatherScale + warp);
+  // h is 0 at the base of the slab, 1 at the top. lod winds the fine erosion
+  // octaves down with distance and step length. soft is the base ramp width,
+  // set from the march's step length by the caller.
+  float cloudBody(vec2 q, float h, vec4 cw, float lod, float soft){
+    if (cw.x <= 0.002) return 0.0;
 
-    // SCALE VARIATION. R and G are two independent coverage fbms of different
-    // cell size; the slow region field picks which dominates, so one part of
-    // the sky carries 2 km congestus and another carries 1 km fair-weather
-    // puffs. Blending baked fields costs one lerp — warping the UV by a spatial
-    // scale factor would be the obvious alternative and it shears badly once
-    // the UV is tens of tiles from the origin.
-    // The blend is deliberately near-BINARY. Two independent fbms averaged at
-    // m=0.5 have half the variance of either, and a coverage field with half
-    // the variance never crosses its threshold — that is how a "scale
-    // variation" mix turned the whole sky into one thin filamentary veil with
-    // no cores in it at all. Regions pick a field; only the seams blend.
-    float m   = smoothstep(0.44, 0.56, lo.b);
-    float cov = mix(W.r, W.g, m);
+    // Height inside THIS cloud, measured from its own base.
+    float hn = (h - cw.y) / max(1.0 - cw.y, 0.2);
+    if (hn <= 0.0 || hn >= cw.z * 1.02) return 0.0;
 
-    // Regions that pick the SMALL field also get a lower threshold, so they
-    // carry more, smaller clouds rather than fewer, thinner ones — scale
-    // variation, not coverage variation.
-    float thr = uCloudThreshold + (0.5 - lo.b) * 0.15;
-    // A narrow ramp is what gives a cumulus its near-vertical flanks. Widen it
-    // and the field spends most of its area on the ramp instead of on either
-    // side of it — which is a milky half-density veil over the whole sky, not
-    // a cloud. Squared again on top, so between cumulus it is genuinely clear.
-    cf = smoothstep(thr, thr + 0.085, cov);
-    cf = cf * cf * (3.0 - 2.0 * cf);
-
-    // The condensation level wanders. A laser-flat deck bottom at exactly h=0
-    // across the whole sky is the single loudest tell that a cloud layer is a
-    // shader; real bases are flat PER CLOUD and staggered between clouds.
-    baseH = 0.02 + 0.15 * W.a;
-
-    // Vertical development: deep coverage towers, thin coverage stays a puff.
-    // Kept linear and floored well above zero — squaring it made the cloud
-    // height track the coverage gradient so closely that every cell came out a
-    // smooth cone instead of a mass with flanks and a crown.
-    tower = mix(uCloudTowerMin, uCloudTowerMax, cf);
-  }
-
-  // h is 0 at the base of the slab, 1 at the top. lod > 0.5 adds the second
-  // volume fetch (three more worley octaves); the sun march and distant rays
-  // run without it, where those octaves are below a pixel anyway.
-  float cloudBody(vec2 q, float h, float cf, float baseH, float tower, float lod){
-    if (cf <= 0.002) return 0.0;
-
-    // Height inside THIS cell, measured from its own base.
-    float hn = (h - baseH) / max(1.0 - baseH, 0.2);
-    if (hn <= 0.0 || hn >= 1.0) return 0.0;
-
-    // A cumulus base is genuinely flat and genuinely hard — that part of the
-    // old render was not the problem. What made it read as a lens was that the
-    // OUTLINE was smooth at every height. So: keep the base ramp sharp, and let
-    // the 3D erosion below carve the perimeter instead.
-    // The base ramp cannot be sharper than a march step or the jitter resolves
-    // it per pixel and the deck grows vertical drips off every cloud bottom.
-    // 0.085 of the slab is ~290 m, which is about two steps and still reads as
-    // a flat base from the ground.
-    float base = smoothstep(0.0, 0.085, hn);
-    // Full density up to 60% of the tower, then a rounded shoulder. Ramping
+    // A cumulus base is genuinely flat and genuinely hard. The ramp cannot be
+    // sharper than a march step, though, or the start jitter resolves it per
+    // pixel and the deck grows vertical drips off every cloud bottom — which it
+    // did, visibly, at a fixed 0.085. So the width is handed down from the
+    // march: steep rays take short steps and get a knife-edge base, grazing
+    // rays take long ones and get a soft base they cannot alias.
+    float base = smoothstep(0.0, soft, hn);
+    // Full density up to 55% of the tower, then a rounded shoulder. Ramping
     // from 42% gave a cone: the cloud narrowed all the way from base to apex
     // and the deck read as a field of flames seen from below rather than of
     // masses with flanks and a crown.
-    float top  = 1.0 - smoothstep(tower * 0.60, tower * 1.05, hn);
-    float d = cf * base * top;
+    float top  = 1.0 - smoothstep(cw.z * 0.64, cw.z * 1.04, hn);
+    float d = cw.x * base * top;
     if (d <= 0.002) return 0.0;
 
     // ---- silhouette erosion -------------------------------------------
@@ -718,26 +843,35 @@ ${ATMO_COMMON}
     vec4 n0 = texture(uNoiseVol, vp);
 
     // Octave budget is set by the STEP LENGTH, not by taste. A ray steps
-    // ~190 m through the deck; carving 50 m notches at that step size is not
+    // ~110 m through the deck; carving 40 m notches at that step size is not
     // detail, it is variance, and variance in a raymarch is coherent ALONG the
     // ray — which is why an over-detailed deck comes out covered in radial
     // scratches rather than in grain. So the finest octave here is the 12-cell
-    // worley at ~155 m, and its weight is wound down further with distance.
-    // Silhouette octaves still add up: 2 km cells and four coverage octaves
-    // from the weather map, then 620 / 310 / 155 m from the volume.
-    float billow = mix(n0.g * 0.62 + n0.b * 0.38,
-                       n0.g * 0.46 + n0.b * 0.34 + n0.a * 0.20, lod);
+    // worley at ~115 m, and its weight is wound down with distance.
+    float billow = mix(n0.g * 0.52 + n0.b * 0.32 + n0.a * 0.16,
+                       n0.g * 0.38 + n0.b * 0.34 + n0.a * 0.28, lod);
+    // Averaging independent worley octaves collapses their contrast: three
+    // fields of sd ~0.20 average to sd ~0.12, and a 0.12 swing in the erosion
+    // field moves the silhouette by a few dozen metres, which is invisible.
+    // Re-expanding to the full range is the difference between a carved
+    // cauliflower edge and a faint fuzz on an ellipse.
+    billow = clamp((billow - 0.30) * 2.25, 0.0, 1.0);
+    float wisp = clamp((n0.r - 0.33) * 2.40, 0.0, 1.0);
     // Wispy shreds at the base, packed cauliflower at the crown — the classic
     // cumulus erosion split, and the reason a crown reads as lobes rather than
     // as a smooth lens.
-    float e = mix(mix(0.5, n0.r, lod), billow, smoothstep(0.02, 0.55, hn));
+    float e = mix(mix(0.5, wisp, lod), billow, smoothstep(0.02, 0.55, hn));
 
     // Erode the SILHOUETTE, not the interior. remap(d, k*gap, 1, 0, 1) moves
     // the zero crossing — the boundary itself is carved — while leaving d=1
     // exactly 1, so cores stay solid however hard the edges are chewed.
     // Normalising by (1-k) instead, as the previous pass did, scaled the whole
     // field and turned an eroded deck into a translucent smear.
-    float k = uCloudDetail * mix(0.88, 1.10, smoothstep(0.05, 0.85, hn))
+    // The strength is PER CLOUD (cw.w): some are hard-edged cauliflower, some
+    // are half dissolved into rag. Two clouds of the same size and height still
+    // do not read as the same object if one of them is falling apart.
+    float k = uCloudDetail * (1.22 - 0.46 * cw.w)
+                           * mix(0.88, 1.10, smoothstep(0.05, 0.85, hn))
                            * mix(0.70, 1.0, clamp(lod, 0.0, 1.0));
     float gap = min(k * (1.0 - e), 0.96);
     return clamp((d - gap) / (1.0 - gap), 0.0, 1.0);
@@ -802,7 +936,7 @@ ${ATMO_COMMON}
   // The weather terms are passed in rather than refetched: coverage varies over
   // kilometres and this march covers a few hundred metres, so re-running it
   // would buy nothing and cost two texture fetches per step.
-  float cloudLightOD(vec3 p, float hn, float dens, float cf, float baseH, float tower, float jit){
+  float cloudLightOD(vec3 p, float hn, float dens, vec4 cw, float soft, float jit){
     float ds = uCloudThick * 0.055;
     // Jittered, and less aggressively geometric than before. This march feeds
     // the silver lining through exp(-od), and the forward lobe multiplies it by
@@ -818,7 +952,7 @@ ${ATMO_COMMON}
       float hh = (length(sp) - RG - uCloudHeight) * uInvThick;
       t += sdt * 0.5;
       if (hh > 1.0 || hh < 0.0) continue;
-      od += cloudBody(cloudUV(sp, hh), hh, cf, baseH, tower, 0.0) * sdt;
+      od += cloudBody(cloudUV(sp, hh), hh, cw, 0.0, soft) * sdt;
     }
     // Plus the column of cloud still above this sample. A few short steps only
     // reach ~0.8 km, so the rest is added analytically — and it is this term,
@@ -892,6 +1026,11 @@ ${ATMO_COMMON}
     }
 
     // --- main cumulus deck: a marched slab -------------------------------
+    // A real early-out, not a cosmetic one: at zero opacity the march is
+    // skipped entirely rather than run and then multiplied by zero. That is
+    // what makes a controlled A/B of the march's cost possible from JS.
+    if (uCloudOpacity <= 0.001) return col;
+
     float tB = raySphereFar(ro, rd, RG + uCloudHeight);
     float tT = raySphereFar(ro, rd, RG + uCloudHeight + uCloudThick);
     if (tT <= 0.0) return col;
@@ -906,19 +1045,25 @@ ${ATMO_COMMON}
     // cumulus crown should have been. Growing steps cover the whole chord
     // instead: the near face, where all the silhouette lives, gets 50-150 m,
     // and the tail runs coarse out in the haze where nothing is resolvable.
-    const float GROW = 0.042;
+    // GROW is 3x what it was. The old 0.042 grew the last step to only 2.5x the
+    // first, so 36 steps covered 2.5 km of chord at the 0.17 km cap — and a ray
+    // at 8 degrees has a 14 km chord through the deck. Everything past 2.5 km
+    // was simply not drawn, which is why the deck stopped dead partway down the
+    // frame and hung as a band across the top instead of receding to the
+    // horizon. At 0.12 the same 36 steps reach 22 km, which is past the range
+    // aerial perspective has already dissolved the deck at.
+    const float GROW = 0.12;
     const float GSUM = float(CLOUD_STEPS)
                      + GROW * 0.5 * float(CLOUD_STEPS) * float(CLOUD_STEPS - 1);
     float span = tT - tB;
     if (span <= 0.0) return col;
-    // Cap the first step at 170 m. sigma*dt at one step decides whether a
-    // single sample can take a pixel from clear to opaque, and if it can, the
-    // jitter turns that coin flip into speckle. The cap does truncate a grazing
-    // chord at ~10 km — but a grazing ray through a deck this dense has already
-    // hit the transmittance break long before then, so the cut only exists
-    // where the deck is thin enough for it to be invisible.
-    float dt0 = min(span / GSUM, 0.17);
-    if (dt0 <= 0.0) return col;
+    // sigma*dt at one step decides whether a single sample can take a pixel
+    // from clear to opaque, and if it can, the jitter turns that coin flip into
+    // speckle. 115 m against the 9/km extinction is sigma*dt ~ 1.0, which is
+    // the point where the stratified jitter below can still hide it. The floor
+    // stops a near-vertical ray (2 km chord) from spending 36 samples on 60 m
+    // steps it cannot see the benefit of.
+    float dt0 = clamp(span / GSUM, 0.030, 0.115);
 
     // Two-lobe HG. The wide lobe is the body of the cloud; the tight forward
     // lobe is the silver lining and is gated on a THIN path to the sun below,
@@ -928,38 +1073,50 @@ ${ATMO_COMMON}
     // gain it turns every wobble in the sun march into a blown highlight.
     float phFwd  = min(hgPhase(cosT, 0.82) * 12.566370614, 45.0);
 
-    // Per-pixel start jitter, over the FULL step. This is the fix for the
-    // corduroy: a few dozen samples across a slab band into iso-height rings,
-    // and the old jitter only spanned 0.4 of a step, so 60% of every ring
-    // survived as a coherent stripe.
+    // Per-pixel start jitter, STRATIFIED over a 2x2 screen block.
     //
-    // The dither is deliberately WHITE, not interleaved-gradient. IGN has the
-    // lower variance of the two, but its error is spatially structured, and a
-    // structured error at this sample count reads as a halftone screen over the
-    // whole deck — measurably better, visibly worse. White noise of the same
-    // amplitude reads as grain, which is what the post chain is already full of.
-    // Rolled per frame so a static camera dissolves the residue. The hash takes
-    // time as a genuine THIRD input rather than as an offset on the pixel
-    // coordinate: fed 2D, this hash family correlates along a column, and a
-    // jitter that is constant down a column puts the whole march out of phase
-    // one column at a time — vertical scratches, not grain.
-    float jit = pixelHash(gl_FragCoord.xy, floor(uTime * 30.0));
+    // The previous pass used pure white noise and honestly flagged the residual
+    // stipple as unresolved. Pure white noise is the worst available choice
+    // here: each pixel draws its offset independently from the whole step, so
+    // four adjacent pixels can all land in the same quarter of it and the local
+    // mean carries the full per-sample variance. The alternative it rejected —
+    // interleaved gradient noise — is fully deterministic and does read as a
+    // halftone screen.
+    //
+    // Stratification is neither. The 2x2 Bayer index picks WHICH QUARTER of the
+    // step a pixel samples, so the four pixels in every block are guaranteed to
+    // cover all four quarters; the white hash then places the sample randomly
+    // INSIDE its quarter, so there is no fixed pattern to read as a screen. The
+    // variance of the local 2x2 mean drops ~4x, and SMAA and CAS downstream
+    // integrate over exactly that neighbourhood. The block index is rolled per
+    // frame so the assignment is not nailed to the screen in motion.
+    ivec2 ip = ivec2(gl_FragCoord.xy);
+    int strat = ((((ip.x & 1) * 2) ^ ((ip.y & 1) * 3)) + int(uTime * 30.0)) & 3;
+    float jit = (float(strat) + pixelHash(gl_FragCoord.xy, floor(uTime * 30.0))) * 0.25;
+
+    // Base ramp width, handed to cloudBody. A cumulus base wants to be a knife
+    // edge, but a knife edge sampled at 400 m steps aliases into the vertical
+    // drips hanging off every cloud bottom in the previous render. Tie it to
+    // the step: ~1.4 steps of slab, floored at a width that still reads flat.
+    float soft = clamp(dt0 * uInvThick * 1.4, 0.055, 0.34);
+
     float t = tB;
     float trans = 1.0;
     vec3  scat = vec3(0.0);
     float lastOD = 0.0;
-    vec4  region = cloudRegion(cloudUV(ro + rd * (tB + span * 0.5), 0.5));
+    float tHit = -1.0;
 
     // Detail budget. Two independent limits, and the tighter one wins:
     //   - STEP LENGTH. Detail finer than the step is not detail, it is variance,
     //     and variance in a raymarch is coherent along the ray, so it shows up
     //     as radial scratches rather than as grain.
-    //   - DISTANCE. Past ~8 km a cumulus billow is a couple of degrees wide and
+    //   - DISTANCE. Past ~15 km a cumulus billow is a couple of degrees wide and
     //     the fine octaves fall under a pixel.
-    // Winding the octaves down is also most of the shader's distance LOD, worth
-    // roughly 25 fps on a wide shot.
-    float lod = min(clamp((0.26 - dt0) / 0.15, 0.0, 1.0),
-                    clamp(1.0 - (tB - 3.0) / 5.0, 0.0, 1.0));
+    // Both thresholds are re-scaled for the new step schedule; lod is a mix
+    // weight on channels of a fetch that happens either way, so widening it
+    // costs a lerp and nothing else.
+    float lod = min(clamp((0.135 - dt0) / 0.075, 0.0, 1.0),
+                    clamp(1.0 - (tB - 5.0) / 10.0, 0.0, 1.0));
 
     for (int i = 0; i < CLOUD_STEPS; i++){
       if (t > tT) break;
@@ -968,29 +1125,35 @@ ${ATMO_COMMON}
       // ray start. With a growing step a single start offset spans dt0 while
       // the step at i=20 is 2.1x dt0, so half of every iso-height ring survives
       // — and a surviving ring on a slab is the corduroy the review named.
-      // 0.85 of a step, centred. A full-width jitter fully decorrelates the
-      // banding but hands back all of that error as per-pixel variance; at 85%
-      // the residual ring is below the noise floor and the speckle is a sixth
-      // lower. The last 15% is not worth what it costs.
-      vec3 p = ro + rd * (t + dt * (0.5 + 0.85 * (jit - 0.5)));
+      // Now essentially the FULL step. The previous pass held it to 0.85
+      // because a full-width white jitter hands back all of the debanding as
+      // per-pixel variance; stratified, the variance is already down 4x in the
+      // local mean, so the last 15% is free and the residual ring goes with it.
+      vec3 p = ro + rd * (t + dt * (0.5 + 0.98 * (jit - 0.5)));
       float h = clamp((length(p) - RG - uCloudHeight) * uInvThick, 0.0, 1.0);
       vec2 q = cloudUV(p, h);
-      float cf, baseH, tower;
-      cloudWeather(q, region, cf, baseH, tower);
-      float dens = cloudBody(q, h, cf, baseH, tower, lod);
+      vec4 cw = cloudWeather(q);
+      float dens = cloudBody(q, h, cw, lod, soft);
       // Skip the thin fringe the erosion leaves around every cloud. Below this
       // the sample contributes a percent of alpha and a full step of variance,
       // which is the scratchy residue that survives on cloud edges.
       if (dens > 0.018){
-        float hn = clamp((h - baseH) / max(1.0 - baseH, 0.2), 0.0, 1.0);
+        if (tHit < 0.0) tHit = t;
+        float hn = clamp((h - cw.y) / max(1.0 - cw.y, 0.2), 0.0, 1.0);
         // Once the ray is nine tenths absorbed, the remaining samples move the
         // final colour by under a percent, so they reuse the last sun march
         // instead of paying for their own. Deep inside a cumulus that is most
         // of the samples, and the sun march is the single most expensive thing
         // in the shader.
+        // Per-cloud density character. Some cells are solid and shadow hard,
+        // some are half-condensed rag the sun goes straight through — and that
+        // difference in VALUE, not just in outline, is a large part of why a
+        // real cumulus field never reads as repeated copies of one object.
+        float dmul = 0.62 + 1.05 * cw.w;
+
         float od = lastOD;
         if (trans > 0.10){
-          od = cloudLightOD(p, hn, dens, cf, baseH, tower, jit) * uCloudAbsorb;
+          od = cloudLightOD(p, hn, dens, cw, soft, jit) * uCloudAbsorb * dmul;
           lastOD = od;
         }
 
@@ -1007,7 +1170,7 @@ ${ATMO_COMMON}
         float amb = mix(0.04, 1.02, smoothstep(0.0, 0.72, hn));
         vec3 S = uCloudSunColor * (ms + silver) + uCloudAmbient * amb;
 
-        float sigma = dens * uCloudDensity;
+        float sigma = dens * uCloudDensity * dmul;
         float dT = exp(-sigma * dt);
         scat += trans * (1.0 - dT) * S;
         trans *= dT;
@@ -1020,7 +1183,12 @@ ${ATMO_COMMON}
     if (alpha <= 0.002) return col;
 
     vec3 c1 = scat / max(1.0 - trans, 1.0e-3);
-    float aer1 = 1.0 - exp(-(tB + min(span, 12.0) * 0.5) * uAerial);
+    // Aerial perspective from the depth the ray actually FIRST hit cloud, not
+    // from the slab entry plus half a chord. On a grazing ray the chord is
+    // 40 km and the old estimate put every distant cloud 20 km further into the
+    // haze than it is, which greyed the far field out of existence — the deck
+    // had to stop somewhere, and where it stopped was a band across the sky.
+    float aer1 = 1.0 - exp(-max(tHit, tB) * uAerial);
     c1 = mix(c1, uHorizonColor, clamp(aer1, 0.0, 1.0));
 
     return mix(col, c1, clamp(alpha, 0.0, 1.0));
@@ -1195,45 +1363,78 @@ export class Sky {
       sunAzimuthEnd: 285.0,
 
       // --- clouds ---
-      cloudCoverage: 0.40,        // 0 clear .. 1 overcast
-      // Cell size, km. A cumulus congestus is TALLER THAN WIDE — the previous
-      // deck ran 2.7 km cells against a 2.7 km slab that only ever filled two
-      // thirds of its height, so every cell came out a squat lens. 1.95 km of
-      // width against 3.4 km of depth is the congestus proportion.
-      cloudCellKm: 2.50,
-      cloudHeight: 2.35,          // base of the cumulus slab, km
-      cloudThickness: 2.70,       // slab depth — this is what gives them form
+      cloudCoverage: 0.46,        // 0 clear .. 1 overcast. Against a splatted
+                                  // weather map this cuts each cloud's own
+                                  // falloff, so it trades gap for mass rather
+                                  // than adding or removing whole clouds.
+      // Nominal cloud size unit, km. Individual clouds are drawn from
+      // cloudRadiusMin..Max BELOW, both expressed in these units, so this knob
+      // scales the whole population without flattening its spread.
+      cloudCellKm: 1.65,
+      cloudHeight: 2.05,          // base of the cumulus slab, km
+      // 1.85 km of slab against a population whose towers span 0.14-1.0 of it
+      // gives cloud depths from 260 m to 1.85 km — a 7x spread. The old 2.70 km
+      // slab was deeper but every cloud filled the same 80% of it, so the extra
+      // depth bought nothing but the slanted-cylinder silhouette the review saw.
+      cloudThickness: 1.85,
       cloudOpacity: 1.0,          // final alpha multiplier
-      cloudDensity: 13.0,         // extinction per km at full density
-      cloudAbsorb: 2.65,          // self-shadow gain (underside vs top)
-      cloudDetail: 0.72,          // silhouette erosion strength
-      cloudShear: 0.55,           // km the top leans downwind of the base
+      cloudDensity: 9.0,          // extinction per km at full density. Down from
+                                  // 13: sigma*dt at one march step is what turns
+                                  // the start jitter into speckle, and the step
+                                  // cannot be shortened further inside budget.
+      cloudAbsorb: 2.30,          // self-shadow gain (underside vs top)
+      cloudDetail: 0.86,          // silhouette erosion strength (x per-cloud)
+      // km the top leans downwind of the base. 0.55 over a 2.70 km slab leaned
+      // every cloud 11 degrees THE SAME WAY, which is what extruded the whole
+      // population into identically-slanted cylinders seen end-on. 0.12 is a
+      // real cumulus lean and is not a shape the eye can index on.
+      cloudShear: 0.12,
       // Vertical anisotropy of the 3D erosion noise. 1.0 is isotropic — a
       // billow as tall as it is wide. Below 1 stretches the lobes vertically,
       // which is the correct direction for a convective cloud; ABOVE 1 squashes
       // them into horizontal laminations, and that (at an effective 1.6) is
       // half of where the ribbed-plastic corduroy came from.
-      cloudBillow: 0.95,
-      // How far up the slab a cell tows, between thin coverage and solid. A
-      // congestus is roughly as tall as it is wide, not three times as tall —
-      // letting every solid cell reach the full slab depth turned the deck into
-      // a field of flames seen from below.
-      cloudTowerMin: 0.34,
-      cloudTowerMax: 0.80,
-      cloudFade: 0.036,           // sin(elevation) below which the deck fades
-                                  // out — grazing rays compress the slab into
-                                  // exactly the horizontal smear we are fixing
+      cloudBillow: 0.88,
+      // Slab fraction the shallowest and the deepest cloud in the population
+      // reach. These are now the ends of a per-cloud distribution baked into the
+      // weather map, NOT a function of local coverage — which is the single
+      // change that stops every cloud being the same height.
+      cloudTowerMin: 0.16,
+      cloudTowerMax: 1.00,
+      // Condensation level, as a slab fraction: each cloud gets its own, flat
+      // across its own footprint and staggered against its neighbours.
+      cloudBaseLo: 0.0,
+      cloudBaseSpan: 0.20,
+      cloudFade: 0.020,           // sin(elevation) below which the deck fades
+                                  // out. Lower than before: the deck is now
+                                  // marched far enough to actually reach the
+                                  // horizon, and cutting it at 2 degrees was
+                                  // half of why it read as a band up top
       cloudSilver: 2.8,           // forward-scatter gain (silver lining)
       cloudSpeed: 0.018,          // km/s of drift (18 m/s of wind)
       cloudWind: [0.92, 0.39],
       cloudSunBoost: 1.05,        // 1.0 == a white lambertian cloud
       cloudAmbientBoost: 0.55,
-      // Weather-map tile, in cell widths. 13 cells x 1.95 km = 25 km, which is
+      // Weather-map tile, in cloudCellKm units. 16 x 1.65 km = 26 km, which is
       // past the range aerial perspective has already washed everything out at.
-      weatherCells: 13.0,
-      weatherWarp: 0.085,         // domain warp, in weather-tile units (~2 km)
-      volumeTileKm: 1.85,         // repeat period of the erosion volume
-      aerial: 0.028,              // cloud aerial-perspective density, per km.
+      weatherCells: 16.0,
+      // --- cloud population, read at construction to bake the weather map ---
+      // Radii in cloudCellKm units. 0.30..2.10 is a 7x span; the draw is cubed
+      // so the population is mostly small with a thin tail of congestus.
+      cloudRadiusMin: 0.30,
+      cloudRadiusMax: 2.10,
+      // Total splat area as a fraction of the tile, before overlap. Sets how
+      // many clouds get placed (~0.9 -> a few hundred over 26 km).
+      cloudAreaBudget: 0.78,
+      // How far the 2-5 lobes of one cloud scatter inside it, as a fraction of
+      // the room available. 0 is a single smooth ellipse; 1 is a loose cluster.
+      cloudLobeScatter: 0.92,
+      // Repeat period of the erosion volume. 1.40 km puts its three worley
+      // octaves at 465 / 235 / 115 m. At the old 1.85 the coarsest lobe was
+      // 620 m and the median cloud in the new population is only ~900 m wide,
+      // so most clouds got barely one lobe across and came out featureless.
+      volumeTileKm: 1.40,
+      aerial: 0.030,              // cloud aerial-perspective density, per km.
                                   // Also what dissolves the horizon pebble row:
                                   // a 40 km cloud is 70% haze before it is drawn
 
@@ -1290,7 +1491,16 @@ export class Sky {
     // Procedural cloud noise. ~0.4 s of one-off JS at construction buys the
     // 3-4 octaves of 3D worley the silhouette needs, which is not affordable
     // any other way (see buildCloudVolume). Zero external assets.
-    this._weatherTex = buildWeatherTexture(512);
+    const _p = this.params;
+    const _cellKm = Math.max(_p.cloudCellKm, 0.10);
+    this._weatherTex = buildWeatherTexture(512, {
+      tileKm: _cellKm * Math.max(_p.weatherCells, 2.0),
+      radiusMinKm: _p.cloudRadiusMin * _cellKm,
+      radiusMaxKm: _p.cloudRadiusMax * _cellKm,
+      areaBudget: _p.cloudAreaBudget,
+      lobeScatter: _p.cloudLobeScatter,
+    });
+    this._cloudCount = buildWeatherTexture.lastCount;
     this._volumeTex = buildCloudVolume(64);
 
     this._buildTargets();
@@ -1366,11 +1576,12 @@ export class Sky {
       uCloudThick: { value: 1.55 },
       uInvThick: { value: 1 / 1.55 },
       uWeatherScale: { value: 0.04 },
-      uWeatherWarp: { value: 0.09 },
       uVolScale: { value: 0.55 },
       uCloudVert: { value: 2.7 },
-      uCloudTowerMin: { value: 0.42 },
-      uCloudTowerMax: { value: 0.92 },
+      uCloudTowerMin: { value: 0.16 },
+      uCloudTowerMax: { value: 1.0 },
+      uCloudBaseLo: { value: 0.0 },
+      uCloudBaseSpan: { value: 0.2 },
       uCloudThreshold: { value: 0.54 },
       uCloudOpacity: { value: 1.0 },
       uCloudDensity: { value: 9.0 },
@@ -1481,7 +1692,6 @@ export class Sky {
     // The weather map's base octave is `weatherCells` across its tile, so one
     // cell is one cloud; the uniform is the km -> tile-uv factor.
     u.uWeatherScale.value = 1.0 / (cell * Math.max(p.weatherCells, 2.0));
-    u.uWeatherWarp.value = p.weatherWarp;
     u.uVolScale.value = 1.0 / Math.max(p.volumeTileKm, 0.10);
     // Map the slab's normalised height onto real kilometres before it enters
     // the noise, so the erosion is isotropic (x cloudBillow) rather than
@@ -1489,6 +1699,8 @@ export class Sky {
     u.uCloudVert.value = thick * Math.max(p.cloudBillow, 0.05);
     u.uCloudTowerMin.value = p.cloudTowerMin;
     u.uCloudTowerMax.value = p.cloudTowerMax;
+    u.uCloudBaseLo.value = p.cloudBaseLo;
+    u.uCloudBaseSpan.value = p.cloudBaseSpan;
     u.uCloudThreshold.value = 1.0 - p.cloudCoverage;
     u.uCloudOpacity.value = p.cloudOpacity;
     u.uCloudDensity.value = p.cloudDensity;
