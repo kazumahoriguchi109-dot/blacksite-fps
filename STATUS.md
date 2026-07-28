@@ -61,8 +61,13 @@ nav grid, procedural WebAudio, wave-based game mode with respawn.
    puff gets barely one lobe across it. A proper fix needs a second volume fetch
    at a cloud-size-dependent scale, which does not fit at performance parity.
    Cloud march stipple is reduced, not eliminated — visible pixel-peeped at 3x.
-2. **Triangles still above target**: 1.27 M vs a 900 k goal (draw calls are now
-   under budget). `src/world/Level.js`, `src/world/Props.js`.
+2. **Triangle "overage" is mostly the shadow pass, and the budget was
+   ambiguous.** Measured: shadows off gives 399 calls / 820 k triangles; shadows
+   on gives 697 / 1.58 M. So the *main* pass sits right at the 450/900 k budget
+   and the second half is the sun's shadow map — normal for one shadow-casting
+   light. Distance culling at 78 m is already applied; tightening it further
+   starts eating shadows the player can see, since the shadow camera runs 26 m
+   ahead of the player with a 52 m half-extent. Treat the budget as *per pass*.
 3. **Enemies at 20 m on sunlit asphalt** now match the ground in value (−0.004).
    There is no single value that beats both sunlit asphalt (0.26) and asphalt in
    shadow (0.12); the fix traded a uniformly-dark figure for a two-tier one so
