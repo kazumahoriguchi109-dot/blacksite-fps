@@ -155,7 +155,14 @@ export class WeaponSystem {
     // about 7 mm outside the frustum — the little finger and the cuff were
     // being sliced by the frame edge. -0.106 puts it at -0.170 with ~15 mm of
     // margin. ADS is unaffected; it uses the sight offset, not this.
-    this.hipPos = new THREE.Vector3(0.150, -0.106, -0.385);
+    // Pushed back again from 0.385 m. At that distance the buttstock filled the
+    // whole lower-right quadrant and the support arm cut the frame diagonally —
+    // a review called it "grotesquely oversized". Real hip poses push the stock
+    // behind the near plane so you read receiver -> handguard -> muzzle
+    // receding. Moving out also widens the frustum at the grip (half-height
+    // 0.185 -> 0.245 m), so the firing hand stays comfortably in frame and the
+    // rest pose can sit lower and more naturally.
+    this.hipPos = new THREE.Vector3(0.147, -0.132, -0.478);
     this.hipRot = new THREE.Vector3(0.018, -0.055, 0.028);
     this.sprintPos = new THREE.Vector3(0.20, -0.185, -0.34);
     this.sprintRot = new THREE.Vector3(-0.16, 0.62, -0.30);
