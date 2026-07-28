@@ -44,6 +44,52 @@ const wrapDelta = (d) => (d > 0.5 ? d - 1 : d < -0.5 ? d + 1 : d);
 /** Distance to the nearest integer, scaled to 0..1 (0 exactly on the line). */
 const lineDist = (x) => { const f = frac(x); return (f < 0.5 ? f : 1 - f) * 2; };
 
+// -------------------------------------------------- low-frequency field cache --
+
+/**
+ * Bake a band-limited tileable field onto an N×N grid once, then read it back
+ * with C1 (smoothstep-weighted bilinear) interpolation.
+ *
+ * This is the whole reason the surfaces below can afford *many* large-scale
+ * condition layers. A `warpedFbm` costs five nested FBMs — call it three times
+ * per texel and a 512 px map is 25 M noise evaluations. But a field sampled at
+ * 3 cycles per tile carries no information above ~24 cycles, so evaluating it
+ * at 64×64 and interpolating is visually identical and ~25x cheaper. Keep the
+ * octave count low enough that the field really is band-limited at N/2 (a
+ * 3-cycle basis with 3 octaves tops out at 12 cycles, well under the 32 that a
+ * 64-grid resolves) — otherwise the top octaves alias into low-frequency mush.
+ *
+ * C1 interpolation matters because several of these feed the height field, and
+ * plain bilinear would put a visible crease at every grid line once the driver
+ * runs its Sobel over it.
+ */
+function coarse(fn, N = 64) {
+  const g = new Float32Array(N * N);
+  const inv = 1 / N;
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) g[y * N + x] = fn(x * inv, y * inv);
+  }
+  return (u, v) => {
+    const fx = u * N, fy = v * N;
+    const ix = Math.floor(fx), iy = Math.floor(fy);
+    let tx = fx - ix, ty = fy - iy;
+    tx = tx * tx * (3 - 2 * tx); ty = ty * ty * (3 - 2 * ty);
+    const x0 = ((ix % N) + N) % N, y0 = ((iy % N) + N) % N;
+    const x1 = (x0 + 1) % N, y1 = (y0 + 1) % N;
+    const a = g[y0 * N + x0], b = g[y0 * N + x1];
+    const c = g[y1 * N + x0], d = g[y1 * N + x1];
+    const top = a + (b - a) * tx, bot = c + (d - c) * tx;
+    return top + (bot - top) * ty;
+  };
+}
+
+/** Shorthand: a cached domain-warped FBM at `cycles` per tile. */
+function slowWarp(seed, cycles, { warp = 1.2, octaves = 3, N = 64 } = {}) {
+  const n = makeTileablePerlin2(seed, cycles);
+  return coarse((u, v) => warpedFbm((x, y) => n(x, y), u * cycles, v * cycles,
+                                    { warp, octaves }), N);
+}
+
 // ------------------------------------------------------------- shared bits --
 
 /**
@@ -98,6 +144,96 @@ function makeDiamond(opts = {}) {
     // Weave parity — shifting u or v by 1 moves the sum by ±2·cells, so it tiles.
     const over = ((Math.floor(a) + Math.floor(b)) & 1) === 0;
     return { sA, sB, rA, rB, over, mask: Math.max(sA, sB) };
+  };
+}
+
+/**
+ * Running-bond brickwork where every unit is its own brick.
+ *
+ * The old lattice divided the tile into a perfect grid: N equal columns, N
+ * equal rows, one shared mortar width. That is the single tell that made this
+ * material read as 2005 wallpaper — a real wall has bricks that differ in
+ * length by a good centimetre, courses that wander, and a bond that is only
+ * approximately half-lapped.
+ *
+ * So each course gets its own set of brick lengths (±`lenJitter`, renormalised
+ * so the row still spans exactly one tile and therefore still wraps), its own
+ * bond phase, and its own vertical wander. A 1024-entry lookup per row turns
+ * the variable-width layout back into an O(1) fetch, which is what keeps this
+ * affordable at 512 px.
+ *
+ * Joint widths are given in *real* terms — a 10 mm perp and a 10 mm bed on a
+ * 225 x 75 mm module — rather than as a fraction of the cell, so the joint
+ * stays a shadow line instead of the fat painted grid it used to be.
+ *
+ * Returns per texel: the mortar mask, brick-local coordinates, the brick's own
+ * width, and four independent hashes for per-unit colour, firing and damage.
+ */
+function makeBrickCourses(seed, opts = {}) {
+  const {
+    rows = 28, cols = 12,
+    lenJitter = 0.085,      // ±8.5 % on brick length
+    perp = 0.0037,          // full perp joint, in u-tile units (10 mm / 2.70 m)
+    bed = 0.135,            // full bed joint as a fraction of the course pitch
+    wander = 0.11,          // bed-line undulation, in course fractions
+  } = opts;
+  const rng = makeRNG(seed + 5);
+  // Bed lines undulate as a *family* — settlement moves whole panels of
+  // brickwork, not individual courses. Making the wander a function of u only
+  // is also what keeps it tileable: a per-course constant would put a step at
+  // the v seam, because the course at v=1 and the course at v=0 are different
+  // courses with different offsets.
+  const waveN = makeTileablePerlin2(seed + 811, 3);
+  const bedWave = coarse((u) => fbm((x, y) => waveN(x, y), u * 3, 0.5, { octaves: 3 }), 96);
+  const LUT = 1024;
+  const stride = cols + 1;
+  const edges = new Float32Array(rows * stride);
+  const lut = new Uint16Array(rows * LUT);
+  const phase = new Float32Array(rows);
+  const jit = new Float32Array(rows * cols * 4);
+
+  for (let r = 0; r < rows; r++) {
+    const w = new Float32Array(cols);
+    let sum = 0;
+    for (let i = 0; i < cols; i++) { w[i] = 1 + (rng() * 2 - 1) * lenJitter; sum += w[i]; }
+    let acc = 0;
+    edges[r * stride] = 0;
+    for (let i = 0; i < cols; i++) { acc += w[i] / sum; edges[r * stride + i + 1] = acc; }
+    edges[r * stride + cols] = 1;
+    // Half-lap, plus enough slop that the perps do not line up every other course.
+    phase[r] = ((r & 1) * 0.5 + (rng() - 0.5) * 0.30) / cols;
+    let k = 0;
+    for (let s = 0; s < LUT; s++) {
+      const t = (s + 0.5) / LUT;
+      while (k < cols - 1 && t >= edges[r * stride + k + 1]) k++;
+      lut[r * LUT + s] = k;
+    }
+  }
+  for (let i = 0; i < jit.length; i++) jit[i] = rng();
+
+  return (u, v) => {
+    const rowF = v * rows + bedWave(u, 0) * wander;
+    const rowI = Math.floor(rowF);
+    const r = ((rowI % rows) + rows) % rows;
+    const fv = rowF - rowI;
+
+    let uu = u - phase[r];
+    uu -= Math.floor(uu);
+    const i = lut[r * LUT + ((uu * LUT) | 0)];
+    const base = r * stride;
+    const e0 = edges[base + i], e1 = edges[base + i + 1];
+    const wid = e1 - e0;
+    const fu = (uu - e0) / wid;
+
+    const mw = perp * 0.5 / wid;      // half-joint each side of the unit
+    const mh = bed * 0.5;
+    const brick = smoothstep(0, mw, fu) * smoothstep(1, 1 - mw, fu)
+                * smoothstep(0, mh, fv) * smoothstep(1, 1 - mh, fv);
+    const jb = (r * cols + i) * 4;
+    return {
+      brick, fu, fv, wid, row: r, col: i,
+      j0: jit[jb], j1: jit[jb + 1], j2: jit[jb + 2], j3: jit[jb + 3],
+    };
   };
 }
 
@@ -203,13 +339,37 @@ function makePaintLoss(seed, opts = {}) {
  * air pockets and a few millimetres of form texture; the visual interest is in
  * the tonal blotching of the pour and in where the surface has been polished.
  */
-function makeConcreteBase(seed) {
-  const macroN = makeTileablePerlin2(seed, 4);         // *4  — pour / patch blotching
+function makeConcreteBase(seed, opts = {}) {
+  const {
+    ties = 0,        // form-tie holes per tile, per axis (0 = none, e.g. a slab)
+    lifts = 0,       // pour lifts per tile — horizontal construction joints
+    panels = 0,      // formwork panel seams per tile, vertically
+    patches = 0,     // patch-repair coverage, 0..1
+    tieR = 0.0085,   // tie-hole radius in tile units (25 mm on a 3 m tile)
+  } = opts;
   const mesoN = makeTileablePerlin2(seed + 41, 16);    // *16 — float and screed marks
   const fineN = makeTileablePerlin2(seed + 91, 96);    // *96 — cement paste grain
   const pores = makeWorley2(seed + 3, 88);             // ~34 mm cells at a 3 m tile
+  // Pour blotching, cached: it is the slowest layer here and by definition the
+  // one with the least detail in it.
+  const macroF = slowWarp(seed, 4, { warp: 1.15, octaves: 3 });
+
+  // --- formwork. A cast wall is a *made* thing and it shows: the tie holes sit
+  //     on the grid the formwork was bolted on, the lift lines are where one
+  //     day's pour met the next, and the panel seams are the plywood joints.
+  //     None of that survives in a pure noise stack, and its absence is most of
+  //     why procedural concrete reads as stucco.
+  const trng = makeRNG(seed + 77);
+  const tieJit = ties > 0 ? new Float32Array(ties * ties * 3) : null;
+  if (tieJit) for (let i = 0; i < tieJit.length; i++) tieJit[i] = trng();
+  const liftTone = new Float32Array(Math.max(1, lifts));
+  for (let i = 0; i < liftTone.length; i++) liftTone[i] = trng();
+
+  const patchW = patches > 0 ? makeWorley2(seed + 611, 5) : null;
+  const patchEdge = patches > 0 ? makeTileablePerlin2(seed + 612, 24) : null;
+
   return (u, v) => {
-    const macro = warpedFbm((x, y) => macroN(x, y), u * 4, v * 4, { warp: 1.15, octaves: 5 });
+    const macro = macroF(u, v);
     const meso = fbm((x, y) => mesoN(x, y), u * 16, v * 16, { octaves: 4 });
     const grain = fbm((x, y) => fineN(x, y), u * 96, v * 96, { octaves: 3 });
     const w = pores(u, v);
@@ -218,17 +378,94 @@ function makeConcreteBase(seed) {
     // Aggregate ghosting just under the skin — tonal only, no relief at all.
     const agg = smoothstep(0.58, 0.92, w.f2 - w.f1);
 
-    const h = 0.5 + macro * 0.026 + meso * 0.013 + grain * 0.010 - pit * 0.042;
-    // Spread matters as much as the mean. Flattening the old ±0.2 blotching all
-    // the way down left concrete reading as emulsion paint; measured samples
-    // sit around σ≈0.03 of value, which is what these coefficients target.
-    const tone = 0.515 + macro * 0.095 + meso * 0.078 + grain * 0.034
-               - pit * 0.070 + agg * 0.022;
-    // Power-floated slab polishes where it is walked and chalks where it is not.
+    let h = 0.5 + macro * 0.026 + meso * 0.013 + grain * 0.010 - pit * 0.042;
+    let tone = 0.515 + macro * 0.095 + meso * 0.078 + grain * 0.034
+             - pit * 0.070 + agg * 0.022;
     const polish = smoothstep(0.04, 0.26, macro);
-    const rough = clamp(0.86 - polish * 0.22 + Math.abs(grain) * 0.05 - agg * 0.05, 0.42, 1);
-    return { h, tone, base: macro, macro, grain, pit, rough };
+    let rough = clamp(0.86 - polish * 0.22 + Math.abs(grain) * 0.05 - agg * 0.05, 0.42, 1);
+
+    // --- lift lines. Each pour is a different batch of the same mix, so the
+    //     bands either side of a joint differ by a few per cent of value — far
+    //     more visible on a real wall than any amount of noise.
+    let joint = 0;
+    if (lifts > 0) {
+      const lf = v * lifts;
+      const li = Math.floor(lf), lfr = lf - li;
+      const batch = liftTone[((li % lifts) + lifts) % lifts];
+      tone *= 0.965 + batch * 0.075;
+      joint = 1 - smoothstep(0.0, 0.010, Math.min(lfr, 1 - lfr));
+      // Grout bleeds out under the shutter and dries as a pale ragged dribble.
+      const bleed = smoothstep(0.045, 0.0, lfr) * (0.4 + meso * 0.6);
+      h -= joint * 0.016;
+      tone -= joint * 0.055;
+      tone += bleed * 0.045;
+      rough += joint * 0.05;
+    }
+
+    // --- plywood panel seams: a shallow proud line where grout ran into the gap.
+    if (panels > 0) {
+      const pf = frac(u * panels);
+      const s = 1 - smoothstep(0.0, 0.007, Math.min(pf, 1 - pf));
+      h += s * 0.008;
+      tone += s * 0.030;
+    }
+
+    // --- form ties. Snapped off flush and mostly never made good, so each one
+    //     is a small recess with a rust bleed running down out of it.
+    if (ties > 0) {
+      const cu = u * ties, cv = v * ties;
+      const ci = Math.floor(cu), cj = Math.floor(cv);
+      const gi = (((cj % ties) + ties) % ties) * ties + (((ci % ties) + ties) % ties);
+      const jx = (tieJit[gi * 3] - 0.5) * 0.22, jy = (tieJit[gi * 3 + 1] - 0.5) * 0.22;
+      const du = (cu - ci - 0.5 - jx) / ties, dv = (cv - cj - 0.5 - jy) / ties;
+      const d = Math.sqrt(du * du + dv * dv);
+      const hole = 1 - smoothstep(tieR * 0.55, tieR, d);
+      // Some were dry-packed with mortar afterwards; those read as a pale plug.
+      const plug = tieJit[gi * 3 + 2] > 0.55 ? 1 : 0;
+      h -= hole * (plug ? 0.010 : 0.055);
+      tone = mix(tone, plug ? tone * 1.16 : tone * 0.52, hole);
+
+      // Rust bleed: only from the unplugged ones, running down the face.
+      if (!plug) {
+        // Distance below this tie, in cell units.
+        let below = -(cv - cj - 0.5 - jy);
+        if (below < 0) below += 1;
+        const across = 1 - smoothstep(tieR * ties * 0.9, tieR * ties * 2.6,
+                                      Math.abs(cu - ci - 0.5 - jx));
+        const run = smoothstep(0.0, 0.03, below) * (1 - smoothstep(0.05, 0.62, below))
+                  * across * (0.55 + meso * 0.8);
+        const bleed = sat(run) * smoothstep(0.35, 0.75, tieJit[gi * 3 + 2] + 0.4);
+        tone *= 1 - bleed * 0.16;
+        rough += bleed * 0.05;
+        // Hand the rust colour back so the caller can tint it iron-oxide.
+        h -= bleed * 0.002;
+        return finish(h, tone, macro, grain, pit, rough, bleed, patchTerm());
+      }
+    }
+    return finish(h, tone, macro, grain, pit, rough, 0, patchTerm());
+
+    // --- patch repairs: a different age and a different mix, feathered in.
+    function patchTerm() {
+      if (!patchW) return 0;
+      const p = patchW(u, v);
+      // A worley cell is a polygon, and a chased-out repair is not. The edge
+      // noise has to be strong enough to destroy the cell shape outright,
+      // otherwise the wall reads as faceted panels.
+      const ragged = fbm((x, y) => patchEdge(x, y), u * 24, v * 24, { octaves: 4 }) * 0.42
+                   + fbm((x, y) => patchEdge(x, y), u * 96, v * 96, { octaves: 3 }) * 0.10;
+      return sat(smoothstep(0.62, 0.24, p.f1 + ragged) * (p.id > 1 - patches ? 1 : 0));
+    }
   };
+
+  function finish(h, tone, macro, grain, pit, rough, bleed, patch) {
+    if (patch > 0) {
+      // A repair is a smoother, greyer, flatter mix than the parent concrete.
+      tone = mix(tone, 0.470 + grain * 0.020, patch * 0.85);
+      rough = mix(rough, 0.80, patch * 0.7);
+      h = mix(h, 0.5 + grain * 0.006, patch * 0.8) + patch * 0.004;
+    }
+    return { h, tone, base: macro, macro, grain, pit, rough: clamp(rough, 0.4, 1), bleed, patch };
+  }
 }
 
 /**
@@ -335,22 +572,29 @@ function makeShatter(seed, opts = {}) {
 
 /** Cast in-situ concrete: pour blotching, hairline cracking, polished paths. */
 function surfaceConcreteFine(seed, opts = {}) {
-  const base = makeConcreteBase(seed);
+  const base = makeConcreteBase(seed, opts);
   const crackN = makeTileablePerlin2(seed + 55, 6);
-  const stainN = makeTileablePerlin2(seed + 771, 3);
+  const stain = slowWarp(seed + 771, 3, { warp: 1.3 });
   return (u, v) => {
     const c = base(u, v);
     const cr = ridged((x, y) => crackN(x, y), u * 6, v * 6, { octaves: 4 });
     const crack = smoothstep(0.90, 0.99, cr);
-    const stain = warpedFbm((x, y) => stainN(x, y), u * 3, v * 3, { warp: 1.3, octaves: 5 });
-    const soot = sat(Math.max(0, stain) * 1.6);
+    const soot = sat(Math.max(0, stain(u, v)) * 1.6);
 
     const h = c.h - crack * 0.045;
     let tone = c.tone - crack * 0.040;
     tone *= 1 - soot * 0.09;
     // Cement is faintly warm. One bias only — a surface that is warm in the
     // reds *and* cool in the blues just reads as chromatic noise.
-    const r = tone * 1.012, g = tone * 1.0, b = tone * 0.980;
+    let r = tone * 1.012, g = tone * 1.0, b = tone * 0.980;
+    // Rust bleeding out of the snapped form ties. Iron oxide is dark red-brown,
+    // and on a pale grey wall a very little of it goes a very long way.
+    const bl = c.bleed || 0;
+    if (bl > 0) {
+      r = mix(r, 0.305 + c.grain * 0.04, bl * 0.60);
+      g = mix(g, 0.185 + c.grain * 0.03, bl * 0.60);
+      b = mix(b, 0.135 + c.grain * 0.02, bl * 0.55);
+    }
     const rough = clamp(c.rough + soot * 0.06 - crack * 0.04, 0.4, 1);
     return { h, r, g, b, rough, metal: 0 };
   };
@@ -407,44 +651,160 @@ function surfaceGravelFine(seed, opts = {}) {
 }
 
 /**
- * Red brickwork. Two things sell it and both were previously inverted: fired
- * clay is a *desaturated* red-brown, not a signal red, and the mortar is
- * LIGHTER and far less saturated than the brick. The joint is a 5 mm recess,
- * not a 25 mm trench — that alone was turning every joint black under AO.
+ * Red brickwork.
+ *
+ * A tiling texture cannot carry authorship on its own; a tiling texture plus a
+ * variation field at a scale much larger than any of its features can. So this
+ * is built in two halves.
+ *
+ * PER UNIT. Every brick gets its own length (see `makeBrickCourses`), its own
+ * value, its own position on a fired-clay hue ramp, and its own firing result.
+ * Real stock brick from one kiln spans an enormous range — salmon-pink
+ * under-burnt units through orange-red to the near-black over-burnt headers
+ * that bricklayers used to pick out into diaper patterns. The old version gave
+ * every brick the same colour ±0.055 of value, which is why a wall of them read
+ * as one flat sheet of red. Some units are also laid a few millimetres proud or
+ * shy of the face, a few have spalled faces exposing a paler unweathered core,
+ * and a handful are gone entirely.
+ *
+ * PER WALL. Four low-frequency condition fields — soot, lime bloom, damp and a
+ * general wash — run at 2–4 cycles per tile, i.e. one feature per metre or so.
+ * They are what makes a 20 m elevation read as sooted at one end, chalked with
+ * efflorescence in the middle and damp in a corner, instead of one mottle
+ * stamped nine times. Each is cached through `coarse`, which is what makes four
+ * of them affordable.
+ *
+ * MORTAR is lighter and much less saturated than the brick — that relationship
+ * is the second-biggest tell after the grid, and it is easy to get backwards
+ * because the cavity map darkens every joint anyway.
  */
 function surfaceBrickFine(seed, opts = {}) {
-  const lattice = makeBrickLattice(seed, {});
+  const {
+    rows = 28, cols = 12, soot: sootAmt = 1.0, damp: dampAmt = 1.0, spall: spallAmt = 1.0,
+  } = opts;
+  const lattice = makeBrickCourses(seed, { rows, cols });
   const grainN = makeTileablePerlin2(seed + 17, 128);
-  const weatherN = makeTileablePerlin2(seed, 6);
-  const sootN = makeTileablePerlin2(seed + 210, 3);
-  const streaks = makeStreaks(seed + 45, { columns: 26, length: 0.55, density: 0.22, width: 0.5 });
+  const faceN = makeTileablePerlin2(seed + 61, 32);
+
+  // --- the four per-wall condition fields.
+  const wash = slowWarp(seed + 101, 2, { warp: 1.3 });          // general weathering
+  const soot = slowWarp(seed + 210, 3, { warp: 1.4 });          // combustion staining
+  const eff = slowWarp(seed + 331, 4, { warp: 0.9 });           // efflorescence / lime
+  const damp = slowWarp(seed + 447, 2, { warp: 1.1 });          // rising / trapped damp
+
+  const runs = makeStreaks(seed + 45, { columns: 34, length: 0.75, density: 0.30, width: 0.45 });
+  const spallW = makeWorley2(seed + 512, 24);
+
   return (u, v) => {
     const L = lattice(u, v);
     const gr = fbm((x, y) => grainN(x, y), u * 128, v * 128, { octaves: 3 });
-    const weather = warpedFbm((x, y) => weatherN(x, y), u * 6, v * 6, { warp: 1.0, octaves: 5 });
-    const soot = warpedFbm((x, y) => sootN(x, y), u * 3, v * 3, { warp: 1.2, octaves: 4 });
+    // Face texture of the individual unit: sand-struck creasing, not tile noise.
+    const face = fbm((x, y) => faceN(x, y), u * 32, v * 32, { octaves: 3 });
 
-    // --- brick body.
-    let br = 0.415 + L.j0 * 0.055, bg = 0.288 + L.j1 * 0.032, bb = 0.252 + L.j2 * 0.028;
-    // A handful of over-fired headers — darker, but still brick, not charcoal.
-    if (L.j2 > 0.90) { br *= 0.80; bg *= 0.83; bb *= 0.88; }
-    br += gr * 0.022; bg += gr * 0.018; bb += gr * 0.016;
+    // ---------------------------------------------------------- per unit ----
+    // Value and hue vary independently: `j0` is how hard this one was fired
+    // (dark = long in the fire), `j1` walks the clay from salmon to purple.
+    const burn = L.j0;
+    const hue = L.j1;
+    // Values are the red channel; the ramp below takes green and blue down from
+    // it, so the finished luma lands around 0.33 — the middle of the 0.32–0.42
+    // reference band for weathered red stock.
+    let val = 0.545 - burn * 0.195;                 // 0.545 salmon .. 0.35 dark
+    // A minority went a long way past temperature — vitrified, near-black, and
+    // slightly blue rather than red. Every real wall has a few, but only a few:
+    // at one brick in eight they stop being character and become a domino grid.
+    const over = smoothstep(0.935, 0.995, L.j2);
+    val *= 1 - over * 0.34;
+    // ...and a few never got there at all.
+    const under = smoothstep(0.10, 0.02, L.j2);
+    val *= 1 + under * 0.20;
 
-    // --- mortar: pale, near-neutral sand/cement. Lighter than the brick, but
-    //     only by about 1.45:1 — push it further and the joints start to read
-    //     as a printed stencil rather than as mortar.
-    const m = 0.500 + gr * 0.030;
-    const mr = m, mg = m * 0.992, mb = m * 0.968;
+    // Fired clay ramp. r/g/b ratios from measured stock brick: the red channel
+    // leads by roughly 1.6:1 over blue for orange stock, 1.25:1 for the blues.
+    const gk = mix(0.640, 0.735, hue) + over * 0.10;
+    const bk = mix(0.520, 0.700, hue) + over * 0.22 - under * 0.04;
+    let br = val * (1 + face * 0.055 + gr * 0.030);
+    let bg = val * gk * (1 + face * 0.048 + gr * 0.026);
+    let bb = val * bk * (1 + face * 0.042 + gr * 0.024);
+
+    // ------------------------------------------------------------ mortar ----
+    // Sand/cement, pale and near-neutral, with its own per-course batch
+    // variation — a wall pointed over several days is never one colour.
+    const batch = 0.955 + ((L.row * 7919) % 13) / 13 * 0.09;
+    const m = (0.545 + gr * 0.035 + face * 0.020) * batch;
+    const mr = m, mg = m * 0.988, mb = m * 0.958;
+
+    // ------------------------------------------------------- unit defects ---
+    const sp = spallW(u, v);
+    // Spalled face: frost has taken the skin off, exposing a paler, chalkier
+    // core. Gate it per *brick*, so damage belongs to a unit rather than
+    // floating across the bond.
+    const spallGate = smoothstep(0.72, 0.86, L.j3) * spallAmt;
+    const spall = sat(smoothstep(0.55, 0.18, sp.f1 + face * 0.35) * spallGate) * L.brick;
+    // A very few units have been knocked right out. This has to stay rare *and*
+    // ragged: filling a whole brick cell with a flat dark value does not read as
+    // a hole, it reads as a domino pip, and at one unit in forty the wall ends
+    // up looking like a game board.
+    const missing = smoothstep(0.984, 0.997, L.j3) * L.brick * spallAmt
+                  * (0.55 + 0.45 * smoothstep(0.85, 0.25, sp.f1 + face * 0.5));
+    // Laid proud or shy — the arris catch that gives a wall its texture.
+    const set = (L.j2 - 0.5) * 0.020;
 
     let r = mix(mr, br, L.brick), g = mix(mg, bg, L.brick), b = mix(mb, bb, L.brick);
-    const wash = clamp(0.94 + weather * 0.13, 0.80, 1.08);
-    r *= wash; g *= wash; b *= wash;
-    // Soot and rain-wash: one-sided, so it only ever darkens.
-    const dirt = sat(Math.max(0, soot) * 0.55 + streaks(u, v) * 0.45);
-    r *= 1 - dirt * 0.22; g *= 1 - dirt * 0.225; b *= 1 - dirt * 0.21;
+    // Exposed core is lighter, less saturated and matte.
+    r = mix(r, val * 1.42, spall * 0.85);
+    g = mix(g, val * gk * 1.50, spall * 0.85);
+    b = mix(b, val * bk * 1.55, spall * 0.85);
 
-    const h = 0.5 + L.brick * 0.036 + gr * 0.011;
-    const rough = clamp(mix(0.93, 0.80 + L.j1 * 0.08, L.brick) + gr * 0.04 + dirt * 0.05, 0.45, 1);
+    // ---------------------------------------------------- per-wall state ----
+    const W = wash(u, v);
+    // Soot is thresholded hard: a wall is sooted in *places*, and a field that
+    // is faintly grubby everywhere just reads as a low-contrast texture.
+    const S = sat((soot(u, v) * 2.4 - 0.12) * sootAmt);
+    const E = sat(smoothstep(0.06, 0.34, eff(u, v)));
+    const D = sat(smoothstep(0.06, 0.34, damp(u, v)) * dampAmt);
+    const run = runs(u, v);
+
+    // General exposure wash: bleached where the rain scours, held where it does not.
+    const k = clamp(1.005 + W * 0.26, 0.82, 1.22);
+    r *= k; g *= k; b *= k;
+
+    // Soot: carbon is neutral and it *covers*, so it pulls everything toward one
+    // dark grey rather than just multiplying the brick down.
+    const carbon = sat(S * 0.90 + run * 0.60 * sat(S + 0.25));
+    r = mix(r, 0.085, carbon * 0.58); g = mix(g, 0.082, carbon * 0.58); b = mix(b, 0.084, carbon * 0.58);
+
+    // Efflorescence: salts wick out and crystallise as a chalky white bloom,
+    // strongest on the mortar because that is where the water travels.
+    // Kept deliberately partial: at much above this it stops looking like salt
+    // coming out of the joints and starts looking like the wall was rendered.
+    const bloom = sat(E * (0.45 + (1 - L.brick) * 0.85)) * (1 - carbon * 0.7);
+    r = mix(r, 0.760, bloom * 0.42); g = mix(g, 0.755, bloom * 0.42); b = mix(b, 0.740, bloom * 0.42);
+
+    // Damp: wet masonry is darker and *more* saturated, and it goes glossy.
+    const wet = D * (1 - bloom * 0.6);
+    r *= 1 - wet * 0.20; g *= 1 - wet * 0.26; b *= 1 - wet * 0.28;
+
+    // Missing unit: a recess with the back-up brickwork in shadow behind it —
+    // 100 mm deep, so plenty of bounce still gets in. Never black.
+    r = mix(r, 0.190 + gr * 0.05, missing);
+    g = mix(g, 0.163 + gr * 0.04, missing);
+    b = mix(b, 0.150 + gr * 0.04, missing);
+
+    // ------------------------------------------------------------ relief ----
+    const h = 0.5
+            + L.brick * 0.034                       // face proud of the joint
+            + L.brick * set                          // per-unit set in the bond
+            + gr * 0.010 + face * 0.008
+            - spall * 0.020
+            - missing * 0.070
+            + bloom * 0.006;
+
+    const rough = clamp(
+      mix(0.94, 0.82 + burn * 0.10, L.brick)
+      + gr * 0.035 + spall * 0.06 + bloom * 0.05 + carbon * 0.04
+      - wet * 0.30,
+      0.32, 1);
     return { h, r, g, b, rough, metal: 0 };
   };
 }
@@ -533,27 +893,156 @@ function surfacePlasterFine(seed, opts = {}) {
   };
 }
 
-/** Hessian sandbags: coarse weave, slumped fill, sun-bleached and dusty. */
+/**
+ * Hessian sandbags — one texture tile is one bag.
+ *
+ * The reason these read as "a pile of crackers" is not the weave, it is that
+ * `chamferedBox` projects world-space UVs from each box's own corner, so every
+ * bag in an emplacement samples the identical patch of an 0.9 m tile: a flat,
+ * uniform, tileable mosaic with no form in it at all. Nothing you do to a
+ * generic cloth pattern fixes that.
+ *
+ * So the material is authored to a tile that matches the bag — 0.50 x 0.20 m
+ * against a 0.50 x 0.185 m bag face — and the pattern is a *single bag seen
+ * face on*: a fill that has slumped so the belly sits below centre, fabric
+ * gathered and creased where the box's chamfer strips run, a sewn seam across
+ * the top, sun bleaching on everything that faces up and dirt in everything
+ * that faces down.
+ *
+ * The weave then has to follow that form or the whole thing collapses back to a
+ * decal. Two things do it: the thread grid is expanded away from the crown, so
+ * the courses crowd together toward the silhouette exactly as a real weave
+ * foreshortens, and the horizontal threads bow down over the belly. Both warps
+ * are chosen so the thread count across the tile stays an *even integer* —
+ * otherwise the plain-weave over/under parity flips at the seam and the tile
+ * stops wrapping.
+ *
+ * Everything else is carried by the height field, because the bulge is what the
+ * cavity map turns into shading: a bright crown, dark gathered ends, and a
+ * genuine shadow line between one bag and the next.
+ */
 function surfaceSandbagFine(seed, opts = {}) {
-  const { tone: baseTone = 0.365 } = opts;
-  const dirtN = makeTileablePerlin2(seed, 6);
-  const weaveN = makeTileablePerlin2(seed + 4, 128);
-  const slumpN = makeTileablePerlin2(seed + 9, 3);
-  return (u, v) => {
-    // 72 cycles on a 0.9 m tile ≈ 12 mm threads — coarse enough to survive
-    // mipmapping, where the old 120-cycle weave was already aliasing.
-    const wu = Math.sin(u * TAU * 72) * 0.5 + 0.5;
-    const wv = Math.sin(v * TAU * 72) * 0.5 + 0.5;
-    const wn = fbm((x, y) => weaveN(x, y), u * 128, v * 128, { octaves: 3 });
-    const cloth = (wu * 0.5 + wv * 0.5) + wn * 0.18;
-    const dirt = warpedFbm((x, y) => dirtN(x, y), u * 6, v * 6, { warp: 1.0, octaves: 5 });
-    const slump = warpedFbm((x, y) => slumpN(x, y), u * 3, v * 3, { warp: 1.1, octaves: 4 });
+  const {
+    tone: baseTone = 0.400,
+    threadsU = 56, threadsV = 22,     // ~9 mm jute on a 0.50 x 0.20 m tile
+    bleach = 1.0,
+  } = opts;
+  // Thread-grid warp amounts. Chosen so threads * (1 + curve) is an even
+  // integer: 56 * (1 + 4/56) = 60, 22 * (1 + 2/22) = 24.
+  const curveU = 4 / threadsU, curveV = 2 / threadsV;
+  const fuzzN = makeTileablePerlin2(seed + 4, 96);
+  const stainN = makeTileablePerlin2(seed + 9, 4);
+  const creaseN = makeTileablePerlin2(seed + 33, 3);
+  const grit = makeWorley2(seed + 21, 40);
+  const stain = coarse((u, v) => warpedFbm((x, y) => stainN(x, y), u * 4, v * 4,
+                                           { warp: 1.2, octaves: 3 }), 48);
 
-    const h = 0.5 + cloth * 0.028 + dirt * 0.016 + slump * 0.022;
-    let tone = baseTone + cloth * 0.038 + dirt * 0.085 + slump * 0.050;
-    tone *= 1 - sat(Math.max(0, dirt) * 1.4) * 0.15;
-    const r = tone * 1.075, g = tone * 1.005, b = tone * 0.820;
-    const rough = clamp(0.93 + cloth * 0.04 - Math.max(0, slump) * 0.05, 0.6, 1);
+  return (u, v) => {
+    // ---------------------------------------------------------- the form ----
+    // Separable so it is exactly zero on all four tile edges; broad powers so
+    // the belly is a plateau and the fall-off happens in the last tenth, which
+    // is where the chamfer strips of the box actually are.
+    const pu = Math.pow(Math.sin(Math.PI * u), 0.55);
+    // v skewed by 0.8 puts the crown at v≈0.42 — the fill has slumped.
+    const pv = Math.pow(Math.sin(Math.PI * Math.pow(v, 0.8)), 0.62);
+    const bulge = pu * pv;
+
+    // ------------------------------------------------------- the fabric -----
+    // Expand the thread grid away from the crown: spacing is widest where the
+    // cloth faces us and crowds toward the silhouette.
+    const wu = u + curveU * (u - 0.5) * (1 - bulge);
+    // ...and let the weft sag over the belly.
+    const wv = v + curveV * (v - 0.5) * (1 - bulge) - 0.035 * pu * pv;
+
+    const a = wu * threadsU, c = wv * threadsV;
+    const ia = Math.floor(a), ic = Math.floor(c);
+    const fa = a - ia, fc = c - ic;
+    // Round thread cross-sections, and a plain weave: at each crossing one
+    // family passes over the other, and they alternate.
+    const ta = Math.pow(Math.sin(Math.PI * fa), 0.50);
+    const tc = Math.pow(Math.sin(Math.PI * fc), 0.50);
+    const over = ((ia + ic) & 1) === 0;
+    const top = over ? ta : tc;
+    const under = over ? tc : ta;
+    // Centred on zero so the weave modulates about the mean rather than
+    // brightening the whole bag.
+    const cloth = (top * 0.80 + under * 0.32) - 0.52;
+    // Broken fibres standing off the surface.
+    const fuzz = fbm((x, y) => fuzzN(x, y), u * 96, v * 96, { octaves: 3 });
+
+    // ------------------------------------------------------- the details ----
+    // Sewn closure across the top of the bag: a doubled hem, a stitch line, and
+    // the puckered ridge of fabric standing above it.
+    const hem = (1 - smoothstep(0.028, 0.060, Math.abs(v - 0.885)))
+              * smoothstep(0.02, 0.10, u) * smoothstep(0.98, 0.90, u);
+    const stitch = (1 - smoothstep(0.15, 0.45, lineDist(u * threadsU * 0.5)))
+                 * (1 - smoothstep(0.008, 0.020, Math.abs(v - 0.885)));
+    const ruffle = smoothstep(0.885, 1.0, v)
+                 * (0.5 + 0.5 * Math.sin(u * TAU * 9 + 1.3)) * pu;
+    // Gathered fabric at the sewn ends: creases pulling into both corners.
+    const endU = smoothstep(0.20, 0.03, u) + smoothstep(0.80, 0.97, u);
+    const gather = sat(endU) * (0.35 + 0.65 * (1 - smoothstep(0.0, 0.55,
+                     lineDist((v - 0.42) * 6))));
+    // Slack folds where the bag has been dropped and settled. Ridged noise, not
+    // a periodic line family — evenly spaced diagonals across every bag read as
+    // corduroy, which is a worse tell than no folds at all.
+    const cr = ridged((x, y) => creaseN(x, y), u * 3, v * 3, { octaves: 3 });
+    const fold = smoothstep(0.70, 0.96, cr) * smoothstep(0.15, 0.55, bulge) * (1 - hem);
+
+    // ----------------------------------------------------------- shading ----
+    // Crevice: everything the bulge does not reach is the gap to the next bag,
+    // and that gap is what separates one bag from its neighbours. It has to be
+    // emphatic — this is the single edge that turns a mosaic back into a stack.
+    const crevice = Math.pow(1 - smoothstep(0.0, 0.55, bulge), 1.4);
+    // Bleaching: hessian goes pale and grey where the sun lands, which on a
+    // stacked wall is the top third of every bag and the crown of the belly.
+    const up = sat(smoothstep(0.34, 0.92, v) * 0.90 + bulge * 0.22) * bleach;
+    const soil = sat(stain(u, v) * 1.5 + 0.35);
+    const g2 = grit(u, v);
+    const dust = smoothstep(0.55, 0.05, g2.f1) * (g2.id > 0.55 ? 1 : 0.25);
+
+    // The form goes almost entirely into the height field, not into albedo.
+    //
+    // chamferedBox gives each face its own planar projection — the front face
+    // reads (x, y), the ends read (z, y), the top and bottom read (x, z) — and
+    // a 72 mm chamfer on a 185 mm bag means most of what you see is chamfer
+    // strip, not face. Paint a high-contrast bag *into the albedo* and those
+    // three projections disagree: the crown lands on one strip and the crevice
+    // on the next, and an emplacement turns into a heap of hard-edged khaki
+    // shards. Relief has no such problem, because a normal and a cavity term
+    // are shading cues that stay plausible whichever way the strip is facing.
+    let tone = baseTone
+             + cloth * 0.075 + fuzz * 0.032
+             + bulge * 0.024                       // the belly catches the light
+             - crevice * 0.030                     // and the gap loses it
+             - fold * 0.026 + hem * 0.014 - gather * 0.016;
+    // Ground-in dirt, strongest low down and in everything below the crown.
+    tone *= 1 - sat(soil * 0.62 + crevice * 0.30) * 0.30;
+
+    // Buff jute; UV takes the yellow out of it long before it takes the value.
+    let r = tone * 1.120, g = tone * 1.010, b = tone * 0.735;
+    const pale = tone * 1.12;
+    r = mix(r, pale * 1.010, up * 0.60);
+    g = mix(g, pale * 0.995, up * 0.60);
+    b = mix(b, pale * 0.925, up * 0.60);
+    // Dry dust sitting on the weave.
+    r += dust * 0.045; g += dust * 0.042; b += dust * 0.034;
+
+    // Relief. These amplitudes are set by *slope*, not by size, because the
+    // driver's Sobel only sees the per-texel difference: the belly rises 0.105
+    // over 160 texels and the weave rises 0.004 over three, so the weave is
+    // still the stronger normal even at a twenty-fifth of the amplitude. Get
+    // that ratio wrong — which the old numbers did, at 0.028 of weave against
+    // 0.022 of slump — and the bag has no form at all, only cloth.
+    const h = 0.5
+            + bulge * 0.105                        // the bag itself
+            + cloth * 0.0040 + fuzz * 0.0016
+            + hem * 0.010 + stitch * 0.0025 + ruffle * 0.010
+            - gather * 0.024 - fold * 0.012
+            - crevice * 0.055;
+
+    const rough = clamp(0.93 + fuzz * 0.05 - up * 0.05 + crevice * 0.04
+                        - cloth * 0.04, 0.65, 1);
     return { h, r, g, b, rough, metal: 0 };
   };
 }
@@ -992,29 +1481,32 @@ function surfaceGlass(seed, opts = {}) {
  */
 function surfaceConcreteStained(seed, opts = {}) {
   const { stain = 1.0 } = opts;
-  const conc = makeConcreteBase(seed);
+  const conc = makeConcreteBase(seed, opts);
   const crackN = makeTileablePerlin2(seed + 55, 8);
-  const sootN = makeTileablePerlin2(seed + 220, 4);
-  const effN = makeTileablePerlin2(seed + 331, 6);
+  const sootF = slowWarp(seed + 220, 4, { warp: 1.3 });
+  const effF = slowWarp(seed + 331, 6, { warp: 0.9 });
   const dark = makeStreaks(seed + 12, { columns: 26, length: 0.8, density: 0.5, width: 0.9 });
   const rusty = makeStreaks(seed + 77, { columns: 60, length: 0.55, density: 0.18, width: 0.25 });
   return (u, v) => {
     const c = conc(u, v);
     const cr = ridged((x, y) => crackN(x, y), u * 8, v * 8, { octaves: 4 });
     const crack = smoothstep(0.87, 0.985, cr);
-    const soot = warpedFbm((x, y) => sootN(x, y), u * 4, v * 4, { warp: 1.3, octaves: 5 }) * 0.5 + 0.5;
-    const eff = warpedFbm((x, y) => effN(x, y), u * 6, v * 6, { warp: 0.9, octaves: 4 });
+    const soot = sootF(u, v) * 0.5 + 0.5;
+    const eff = effF(u, v);
 
     const wet = sat(dark(u, v) * stain);
-    const rustRun = sat(rusty(u, v) * stain);
+    const rustRun = sat(rusty(u, v) * stain + (c.bleed || 0) * 0.9);
     // General grime settling into the pores. Deliberately no height gradient:
     // a "dirtier near the ground" ramp cannot tile, and grounding belongs to
     // the level's vertex darkening / decals, not to a repeating material.
     const grime = sat((soot * 0.85 + wet * 0.8) * stain);
     const bloom = sat(smoothstep(0.10, 0.42, eff) * 0.7);   // efflorescence / lime
 
-    const h = c.h - crack * 0.4 + bloom * 0.012;
-    let tone = c.tone - crack * 0.16;
+    // A hairline crack is a hairline: the 0.4 that used to be here was eight
+    // times the entire relief budget of the surface and gouged black canyons
+    // through the normal map.
+    const h = c.h - crack * 0.045 + bloom * 0.012;
+    let tone = c.tone - crack * 0.06;
     tone *= 1 - grime * 0.42;
     tone = mix(tone, 0.72, bloom * 0.55);
     let r = tone * 1.02, g = tone * 1.0, b = tone * 0.965;
@@ -1030,34 +1522,40 @@ function surfaceConcreteStained(seed, opts = {}) {
 
 /** Painted brickwork: a coat of paint that bridges the mortar and is peeling. */
 function surfaceBrickPainted(seed, opts = {}) {
-  const { color = [0.700, 0.680, 0.640], peel = 0.7 } = opts;
-  const lattice = makeBrickLattice(seed, {});
+  const { color = [0.700, 0.680, 0.640], peel = 0.7, rows = 28, cols = 12 } = opts;
+  const lattice = makeBrickCourses(seed, { rows, cols });
   const grainN = makeTileablePerlin2(seed + 17, 128);
-  const wearN = makeTileablePerlin2(seed, 6);
+  const wearF = slowWarp(seed, 6, { warp: 1.0 });
   const loss = makePaintLoss(seed + 300, { sheets: 6, chips: 22, amount: peel });
   const streaks = makeStreaks(seed + 45, { columns: 30, length: 0.7, density: 0.4, width: 0.8 });
   return (u, v) => {
     const L = lattice(u, v);
     const gr = fbm((x, y) => grainN(x, y), u * 128, v * 128, { octaves: 3 });
-    const wear = warpedFbm((x, y) => wearN(x, y), u * 6, v * 6, { warp: 1.0, octaves: 5 });
+    const wear = wearF(u, v);
 
     // --- paint film: comes off in sheets, and never bonded well to the arrises
     //     of the brick in the first place. No height ramp — see the note in
     //     surfaceConcreteStained.
     const P = loss(u, v);
-    const arris = (1 - smoothstep(0.0, 0.07, Math.min(L.fu, 1 - L.fu))) * 0.22
-                + (1 - smoothstep(0.0, 0.10, Math.min(L.fv, 1 - L.fv))) * 0.16;
-    const peeled = sat(P.loss + arris * smoothstep(0.02, 0.40, wear) * peel);
+    const arris = (1 - smoothstep(0.0, 0.10, Math.min(L.fu, 1 - L.fu))) * 0.42
+                + (1 - smoothstep(0.0, 0.14, Math.min(L.fv, 1 - L.fv))) * 0.34;
+    const peeled = sat(P.loss + arris * smoothstep(-0.10, 0.34, wear) * peel);
 
-    // --- what is underneath. Same calibration as the bare brick surface:
-    //     desaturated fired clay, and mortar that is lighter, not darker.
-    let br = 0.415 + L.j0 * 0.055, bg = 0.288 + L.j1 * 0.032, bb = 0.252 + L.j2 * 0.028;
-    if (L.j2 > 0.90) { br *= 0.80; bg *= 0.83; bb *= 0.88; }
+    // --- what is underneath. Same per-unit model as the bare brick surface:
+    //     value from how hard the unit was fired, hue walking the clay ramp,
+    //     and mortar that is lighter and less saturated, not darker.
+    const val = (0.470 - L.j0 * 0.185) * (1 - smoothstep(0.88, 0.99, L.j2) * 0.42);
+    const gk = mix(0.640, 0.735, L.j1), bk = mix(0.520, 0.700, L.j1);
+    const br = val * (1 + gr * 0.030), bg = val * gk, bb = val * bk;
     const mr = 0.545 + gr * 0.030;
     const sr = mix(mr, br, L.brick), sg = mix(mr * 0.992, bg, L.brick), sb = mix(mr * 0.965, bb, L.brick);
 
-    // --- paint on top; the film sits proud and bridges the mortar joints.
-    const film = 1 - peeled;
+    // --- paint on top; the film sits proud and bridges the mortar joints. It is
+    //     a thin coat brushed onto an absorbent, textured substrate, though, not
+    //     a laminate: the units still ghost through it. Without that the wall
+    //     comes out as featureless grey emulsion and the bond disappears
+    //     entirely, which is a worse lie than an unpainted wall would be.
+    const film = (1 - peeled) * 0.92;
     const fade = 0.86 + wear * 0.24;
     let r = mix(sr, color[0] * fade, film);
     let g = mix(sg, color[1] * fade, film);
@@ -1200,17 +1698,24 @@ function surfaceRustedMetal(seed, opts = {}) {
     const t = sat(corrosion * 1.1);
     // Iron oxide is a dark RED-BROWN. The bright orange everyone reaches for is
     // freshly-wetted rust on clean steel, and it never covers a whole plate.
-    const darkR = 0.170, darkG = 0.098, darkB = 0.070;
-    const orgR = 0.335 + bloom * 0.085, orgG = 0.185 + bloom * 0.042, orgB = 0.112 + bloom * 0.022;
-    let rr = mix(darkR, orgR, sat(lifted * 0.8 + flakeEdge * 0.5 + grain * 0.3 + 0.25));
-    let rg = mix(darkG, orgG, sat(lifted * 0.8 + flakeEdge * 0.5 + grain * 0.3 + 0.25));
-    let rb = mix(darkB, orgB, sat(lifted * 0.8 + flakeEdge * 0.5 + grain * 0.3 + 0.25));
+    // Chroma matters as much as value here. This surface is also what dresses
+    // every rolling hoop and chime on the drums, and those are 25–35 mm bands
+    // read against a painted body — at that width a saturated orange-brown
+    // stops being corrosion and becomes a stripe. Weathered oxide in daylight
+    // is a low-chroma iron brown: r/b around 1.9 for the dark scale and 2.3 for
+    // the fresh bloom, not the 2.4/3.0 this used to author.
+    const darkR = 0.168, darkG = 0.110, darkB = 0.089;
+    const orgR = 0.305 + bloom * 0.075, orgG = 0.192 + bloom * 0.040, orgB = 0.132 + bloom * 0.024;
+    const ramp = sat(lifted * 0.8 + flakeEdge * 0.5 + grain * 0.3 + 0.12);
+    let rr = mix(darkR, orgR, ramp);
+    let rg = mix(darkG, orgG, ramp);
+    let rb = mix(darkB, orgB, ramp);
     rr = mix(rr, darkR * 0.7, pit); rg = mix(rg, darkG * 0.7, pit); rb = mix(rb, darkB * 0.7, pit);
     r = mix(r, rr, t); g = mix(g, rg, t); b = mix(b, rb, t);
     // Rust dust washed down the face.
-    r = mix(r, orgR * 0.8, st * 0.45 * amount);
-    g = mix(g, orgG * 0.8, st * 0.45 * amount);
-    b = mix(b, orgB * 0.8, st * 0.45 * amount);
+    r = mix(r, orgR * 0.82, st * 0.45 * amount);
+    g = mix(g, orgG * 0.82, st * 0.45 * amount);
+    b = mix(b, orgB * 0.86, st * 0.45 * amount);
     r *= 1 - perf * 0.85; g *= 1 - perf * 0.85; b *= 1 - perf * 0.85;
 
     const rough = clamp(mix(0.46 + Math.abs(grain) * 0.2, 0.95 + pit * 0.04, t), 0.20, 1);
@@ -1229,23 +1734,43 @@ function surfacePaintedSteel(seed, opts = {}) {
   const {
     color = [0.145, 0.225, 0.335],
     primer = [0.375, 0.185, 0.135],
-    wearAmt = 1.0, rust = 0.55,
+    wearAmt = 1.0, rust = 0.55, sheets = 15, chips = 42,
   } = opts;
-  const loss = makePaintLoss(seed, { sheets: 7, chips: 26, amount: wearAmt });
+  // Failure scale, not failure amount, is what decides whether this reads as
+  // wear or as livery. At `sheets: 7` a lost patch is 230 mm across on a 1.6 m
+  // tile — wider than the gap between a drum's rolling hoops — so a single
+  // sheet of rust becomes a full horizontal stripe wrapped round the barrel.
+  // At 15 it is 105 mm: still an obvious patch on a container door, but small
+  // enough that several of them land inside every band of a drum instead of
+  // one of them covering a whole band.
+  const loss = makePaintLoss(seed, { sheets, chips, amount: wearAmt });
   const orangeN = makeTileablePerlin2(seed + 90, 8);
   const scratchN = makeTileablePerlin2(seed + 8, 16);
-  const dirtN = makeTileablePerlin2(seed + 210, 6);
+  const dirtN = makeTileablePerlin2(seed + 210, 12);
+  const dentN = makeTileablePerlin2(seed + 311, 5);
   const streaks = makeStreaks(seed + 45, { columns: 48, length: 0.5, density: 0.3, width: 0.3 });
   return (u, v) => {
     const L = loss(u, v);
     const scr = fbm((x, y) => scratchN(x, y), u * 192, v * 16, { octaves: 3 });
-    const chalk = warpedFbm((x, y) => dirtN(x, y), u * 6, v * 6, { warp: 1.0, octaves: 5 });
+    const chalk = fbm((x, y) => dirtN(x, y), u * 12, v * 12, { octaves: 4 });
     const bloom = billow((x, y) => orangeN(x, y), u * 8, v * 8, { octaves: 4 });
+    // Panel dents: relief only, never colour. Drums and plant get knocked about
+    // constantly, and a dent is a shading event, not a paint event.
+    const dent = fbm((x, y) => dentN(x, y), u * 5, v * 5, { octaves: 4 });
 
-    // Topcoat, chalked by UV and thinned on the high spots. The paint has to
-    // stay the dominant read, so this is a gentle fade — the old ±0.28 swing
-    // pushed a mid-value topcoat to near-white at the top of its range.
-    const fade = 0.90 + chalk * 0.13;
+    // Topcoat, chalked by UV and thinned on the high spots.
+    //
+    // This fade is deliberately tiny, and the field it rides on is deliberately
+    // *high* frequency. Painted steel is applied to things far smaller than a
+    // texture tile — a 200 L drum is 0.59 m across a 1.6 m tile, its rolling
+    // hoops are 35 mm bands — and every one of those parts is a separate
+    // cylinder that samples its own narrow strip of V. A low-frequency albedo
+    // swing therefore does not read as weathering at all: each strip lands on a
+    // different patch and the drum comes out banded in four colours like a
+    // novelty barrel. One drum is one colour. The interest has to come from
+    // chipping, dents and rust, all of which are small enough to appear *within*
+    // every strip rather than to differ between them.
+    const fade = 0.955 + chalk * 0.055;
     let r = color[0] * fade, g = color[1] * fade, b = color[2] * fade;
     // Brush/roller drag marks.
     r += scr * 0.012; g += scr * 0.012; b += scr * 0.014;
@@ -1265,14 +1790,17 @@ function surfacePaintedSteel(seed, opts = {}) {
 
     // Runoff below the breaches, plus general grime.
     const run = sat(streaks(u, v) * rust);
-    r = mix(r, 0.295, run * 0.45); g = mix(g, 0.170, run * 0.45); b = mix(b, 0.110, run * 0.45);
-    const dirt = sat(chalk * 0.45 + 0.15);
-    r *= 1 - dirt * 0.18; g *= 1 - dirt * 0.19; b *= 1 - dirt * 0.17;
+    r = mix(r, 0.295, run * 0.26); g = mix(g, 0.172, run * 0.26); b = mix(b, 0.118, run * 0.26);
+    const dirt = sat(chalk * 0.40 + 0.15);
+    r *= 1 - dirt * 0.10; g *= 1 - dirt * 0.105; b *= 1 - dirt * 0.095;
 
     // The paint film has real thickness — the loss edge is a visible step, but
     // a 120 µm step, so it belongs in the roughness far more than the normal.
-    const h = 0.5 + (1 - bare) * 0.018 + chalk * 0.014 - L.sheet * 0.010 + scr * 0.006;
-    const rough = clamp(mix(0.42 + chalk * 0.16, mix(0.5, 0.93, rusty), bare), 0.18, 1);
+    // The dent, by contrast, is millimetres and belongs entirely here.
+    const h = 0.5 + (1 - bare) * 0.018 + dent * 0.030 + chalk * 0.008
+            - L.sheet * 0.010 + scr * 0.006;
+    const rough = clamp(mix(0.42 + chalk * 0.12 + Math.abs(dent) * 0.08,
+                            mix(0.5, 0.93, rusty), bare), 0.18, 1);
     return { h, r, g, b, rough, metal: sat(bare * (1 - rusty * 0.92) * 0.9) };
   };
 }

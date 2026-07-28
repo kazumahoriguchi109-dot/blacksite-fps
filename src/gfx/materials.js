@@ -83,6 +83,12 @@ export function setMaterialDefaults(o = {}) {
  *   seed          texture seed — also the texture cache key, so two entries
  *                 sharing a seed + kind + surfaceOpts share one texture set
  *   surfaceOpts   passed through to the surface function
+ *   size          map resolution for this entry only; overrides DEFAULTS.size.
+ *                 Use it when the pattern has real-world features that have to
+ *                 survive at a large tile — brickwork needs a 10 mm joint to be
+ *                 two texels wide, and at a 2.7 m tile that is a floor on the
+ *                 resolution. Costs O(size²) to generate, so it is not a dial
+ *                 to turn casually: see the boot budget note on preload.
  *   gen           normal/AO derivation for this recipe (see the note below)
  *   tile          metres per texture repeat; number, or [u, v] when the
  *                 pattern is anisotropic (brick courses, plank widths, ribs)
@@ -122,24 +128,34 @@ const CATALOGUE = {
   // ---------------------------------------------------------------- concrete
   concrete_wall: {
     kind: 'concreteFine', seed: 1101, tile: 3.0,
+    // 5 ties per axis = 600 mm centres; 3 lifts = 1 m pours; 2 plywood seams.
+    surfaceOpts: { ties: 5, lifts: 3, panels: 2, patches: 0.35 },
     roughness: 1.0, metalness: 0.0, normalScale: 0.70, ao: 0.90, env: 1.0,
     surface: 'concrete',
     note: 'Cast in-situ shuttered concrete. The bread-and-butter wall material. ' +
           'sRGB albedo sits in 0.41–0.60; the relief is form texture and 3 mm ' +
-          'blowholes, which is why normalScale is well under 1.',
+          'blowholes, which is why normalScale is well under 1. The formwork ' +
+          'evidence is the point: tie holes on the real 600 mm grid, lift lines ' +
+          'between pours of different batches, panel seams, patch repairs in a ' +
+          'different mix, and rust bleeding out of the snapped ties. A noise ' +
+          'stack alone reads as render, not as something that was cast.',
   },
   concrete_floor: {
     kind: 'concreteFine', seed: 1107, tile: 2.5,
+    // No formwork on a slab — but plenty of patching.
+    surfaceOpts: { ties: 0, lifts: 0, panels: 0, patches: 0.45 },
     roughness: 1.02, metalness: 0.0, normalScale: 0.50, ao: 0.80, env: 0.9,
     surface: 'concrete',
-    note: 'Power-floated slab — flatter than the wall, so a softer normal.',
+    note: 'Power-floated slab — flatter than the wall, so a softer normal, and ' +
+          'no tie holes or lift lines because a slab has neither.',
   },
   concrete_stained: {
     kind: 'concreteStained', seed: 1123, tile: 3.0,
-    surfaceOpts: { stain: 1.0 },
+    surfaceOpts: { stain: 1.0, ties: 5, lifts: 3, panels: 2, patches: 0.4 },
     roughness: 1.0, metalness: 0.0, normalScale: 0.70, ao: 0.95, env: 0.9,
     surface: 'concrete',
-    note: 'Soot, efflorescence, rust runoff and splash-back off the ground.',
+    note: 'Soot, efflorescence, rust runoff and splash-back off the ground, on ' +
+          'top of the same formwork evidence as concrete_wall.',
   },
   rebar_concrete: {
     kind: 'rebar', seed: 12101, tile: 1.6,
@@ -181,19 +197,31 @@ const CATALOGUE = {
 
   // ------------------------------------------------------------------- brick
   brick_red: {
-    kind: 'brickFine', seed: 3301, tile: [1.72, 1.04],   // 8 × 215 mm, 16 × 65 mm
-    roughness: 1.0, metalness: 0.0, normalScale: 0.75, ao: 0.85, env: 0.9,
+    kind: 'brickFine', seed: 3301,
+    tile: [2.70, 2.10],                 // 12 × 225 mm module, 28 × 75 mm courses
+    size: 512,
+    surfaceOpts: { rows: 28, cols: 12 },
+    gen: { normalStrength: 1.7, aoRadius: 5, aoStrength: 4.4 },
+    roughness: 1.0, metalness: 0.0, normalScale: 0.80, ao: 0.90, env: 0.9,
     surface: 'brick',
-    note: 'Tile is set from real brick dimensions so courses read at true scale. ' +
-          'Brick body ~0.33 sRGB, mortar ~0.54 — the mortar is LIGHTER and much ' +
-          'less saturated than the brick, and the joint is a 5 mm recess.',
+    note: 'Tile is set from real brick dimensions so courses read at true scale, ' +
+          'and it is a *big* tile: 336 individual units, each with its own ' +
+          'length, value, hue and firing. The old 8 × 16 grid repeated every ' +
+          '1.72 m across a 20 m elevation with 128 identical-length bricks in ' +
+          'it, which is what made it read as wallpaper rather than as a wall. ' +
+          '512 px is the floor at this tile — a 10 mm joint has to survive as ' +
+          'two texels or the bond stops reading at 8 m. Brick body 0.28–0.47 ' +
+          'sRGB, mortar ~0.545: the mortar is LIGHTER and much less saturated ' +
+          'than the brick.',
   },
   brick_painted: {
-    kind: 'brickPainted', seed: 3317, tile: [1.72, 1.04],
-    surfaceOpts: { color: [0.640, 0.630, 0.605], peel: 0.45 },
+    kind: 'brickPainted', seed: 3317, tile: [2.70, 2.10], size: 384,
+    surfaceOpts: { color: [0.640, 0.630, 0.605], peel: 0.45, rows: 28, cols: 12 },
     roughness: 1.0, metalness: 0.0, normalScale: 0.65, ao: 0.85, env: 0.95,
     surface: 'brick',
-    note: 'Whitewashed brick, peeling from the bottom up.',
+    note: 'Whitewashed brick, peeling from the bottom up. Lower resolution than ' +
+          'brick_red on purpose: the paint film bridges the joints, so the ' +
+          'joint line is doing far less work here.',
   },
 
   // ----------------------------------------------------------------- plaster
@@ -328,9 +356,28 @@ const CATALOGUE = {
     note: 'Polished ceramic: low normalScale, high env — it is a mirror at grazing angles.',
   },
   sandbag: {
-    kind: 'sandbagFine', seed: 10101, tile: 0.9,
-    roughness: 1.0, metalness: 0.0, normalScale: 0.60, ao: 0.90, env: 0.75,
+    kind: 'sandbagFine', seed: 10101,
+    tile: [0.50, 0.20],                 // one tile == one 0.50 × 0.185 m bag
+    // normalStrength is an order of magnitude above every other entry, and it
+    // has to be: the Sobel measures a one-texel difference, so a form that
+    // spans the whole tile produces a gradient ~40x smaller than a joint or a
+    // rib does. At the catalogue default of 1.6 this bag's belly turns a
+    // grand total of half a degree and the normal map comes out flat blue.
+    gen: { normalStrength: 20, aoRadius: 26, aoStrength: 5.0 },
+    roughness: 1.0, metalness: 0.0, normalScale: 0.75, ao: 1.00, env: 0.70,
     surface: 'sandbag',
+    note: 'The tile is the bag. chamferedBox projects world-space UVs from each ' +
+          'box\'s own corner, so every bag in an emplacement samples the *same* ' +
+          'patch of the tile — at a 0.9 m tile that patch was a flat 0.55 × ' +
+          '0.21 crop of generic cloth, which is exactly why a wall of them read ' +
+          'as a mosaic of identical crackers. Matching the tile to the bag makes ' +
+          'that unavoidable repeat land on a bag-shaped pattern instead. ' +
+          'aoRadius is 44 rather than 4 because the cavity map is the only thing ' +
+          'that can shade the belly: the term is height minus a blur of height, ' +
+          'so at radius 4 a form spanning the whole tile is indistinguishable ' +
+          'from its own local average and the AO map comes out solid white. At a ' +
+          'seventh of the tile it sees the gaps between bags, which is the edge ' +
+          'that makes a stack read as a stack.',
   },
   rubber: {
     kind: 'rubber', seed: 17101, tile: 0.8,
@@ -557,7 +604,7 @@ export function getMaterial(name, opts = {}) {
   const hit = MATERIAL_CACHE.get(key);
   if (hit) return hit;
 
-  const size = opts.size ?? DEFAULTS.size;
+  const size = opts.size ?? entry.size ?? DEFAULTS.size;
   const seed = opts.seed ?? entry.seed;
   const surfaceOpts = { ...(entry.surfaceOpts || {}), ...(opts.surfaceOpts || {}) };
   const gen = { ...GEN_DEFAULT, ...(entry.gen || {}) };

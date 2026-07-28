@@ -67,6 +67,63 @@ const q = (v) => {
   return Math.round(v * s) / s;
 };
 
+/**
+ * A slumped sandbag, as a single surface with one continuous UV projection.
+ *
+ * These were chamfered boxes: 0.5 x 0.185 x 0.3 with a 0.072 chamfer, which
+ * leaves a 41 mm sliver of flat front face wrapped in twelve chamfer strips —
+ * and `chamferedBox` projects each strip from a different axis pair (x/y, z/y,
+ * x/z). The sandbag material is authored so one texture tile IS one bag, with a
+ * slumped crown, a sewn hem and gathered ends, so three disagreeing projections
+ * of that pattern turned a wall into khaki shards. It had to be flattened to
+ * almost nothing to be usable, which is why the emplacement read as stacked
+ * plates rather than bags.
+ *
+ * This builds a superellipsoid instead — genuinely bag-shaped, with a sag on
+ * top and a flattened base where it rests — and projects UVs planar from the
+ * front so the authored pattern lands the same way on every facet. Sides
+ * stretch, but in a stacked wall the sides are barely seen.
+ */
+function sandbagGeometry(w, h, d, tile, segU = 9, segV = 6) {
+  const g = new THREE.SphereGeometry(0.5, segU, segV);
+  const pos = g.attributes.position;
+  const uv = g.attributes.uv;
+  const [tu, tv] = Array.isArray(tile) ? tile : [tile, tile];
+  const EXP = 0.62;                       // < 1 rounds toward a box
+  const soft = (t) => Math.sign(t) * Math.pow(Math.abs(t), EXP);
+
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const len = Math.hypot(x, y, z) || 1;
+    let nx = soft(x / len), ny = soft(y / len), nz = soft(z / len);
+    // A filled bag bulges at its waist and slumps on top.
+    const waist = 1 + 0.16 * (1 - Math.abs(ny));
+    let px = nx * (w / 2) * waist;
+    let pz = nz * (d / 2) * waist;
+    let py = ny * (h / 2);
+    if (ny > 0) py *= 0.86;                               // sag
+    if (ny < -0.55) py = Math.max(py, -h / 2 * 0.94);     // flattened base
+    pos.setXYZ(i, px, py, pz);
+    // Planar front projection, in the same world units the material expects.
+    uv.setXY(i, (px + w / 2) / tu, (py + h / 2) / tv);
+  }
+  pos.needsUpdate = true;
+  uv.needsUpdate = true;
+  g.computeVertexNormals();
+  return g;
+}
+
+/** Cached sandbag geometry at the material's own texel density. */
+function sandbag(b, w, h, d) {
+  const t = b._tile('sandbag');
+  const key = `sb${q(w)}|${q(h)}|${q(d)}|${t}`;
+  const hit = _geomCache.get(key);
+  if (hit) return hit.clone();
+  const g = sandbagGeometry(q(w), q(h), q(d), t);
+  if (_geomCache.size < CACHE_LIMIT) { _geomCache.set(key, g); return g.clone(); }
+  return g;
+}
+
 /** chamferedBox at the material's own texel density, cached. */
 function cbox(b, w, h, d, mat, chamfer = 0.015) {
   const t = b._tile(mat);
@@ -429,8 +486,12 @@ export function barrel(b, rng, o) {
       fpipe(b, f, 0.035, 0.028, bx, HGT + 0.005, bz, 'sheet_metal_bare', 'y', { segments: 8 });
     }
   }
-  // Label band.
-  fpipe(b, f, RAD + 0.004, 0.2, 0, HGT * 0.52, 0, rng() < 0.5 ? 'warning_stripe' : 'sheet_metal_bare', 'y', { segments: seg, capped: false });
+  // Label band. Never hazard tape: a `warning_stripe` ring wrapped around a
+  // drum reads as a candy stripe, and it was the single loudest object in
+  // several frames. A drum label is a painted or bare-metal band; the yellow
+  // accent is reserved for actual hazard marking under the colour script.
+  fpipe(b, f, RAD + 0.004, 0.2, 0, HGT * 0.52, 0, 'sheet_metal_bare', 'y',
+    { segments: seg, capped: false });
   if (ground) contactDress(b, rng, { x, z, y, w: RAD * 2.6, round: true, amount: 0.8, frags: 4 });
 }
 
@@ -706,7 +767,7 @@ export function sandbagEmplacement(b, rng, o) {
         const lz = (dRow - (depth - 1) / 2) * (cross ? BW * 0.62 : BD * 1.06) + R(rng, -0.035, 0.035);
         const ly = y + BH * 0.55 + r * (BH * 0.86) - sag + R(rng, -0.012, 0.012);
         const squash = 1 - r * 0.018;
-        b.add(cbox(b, (cross ? BD : BW) * R(rng, 0.93, 1.07), BH * R(rng, 0.88, 1.1) * squash, (cross ? BW : BD) * R(rng, 0.93, 1.08), 'sandbag', 0.072), 'sandbag', {
+        b.add(sandbag(b, (cross ? BD : BW) * R(rng, 0.93, 1.07), BH * R(rng, 0.88, 1.1) * squash, (cross ? BW : BD) * R(rng, 0.93, 1.08)), 'sandbag', {
           pos: f.p(u + R(rng, -0.03, 0.03), ly - y, lz),
           rot: [R(rng, -0.07, 0.07), f.rotY + R(rng, -0.14, 0.14), R(rng, -0.1, 0.1)],
           collide: collide && dRow === 0 && r < rows - 1 && i % 2 === 0,
@@ -720,7 +781,7 @@ export function sandbagEmplacement(b, rng, o) {
     // Bags that fell off the front, one split with its sand run out.
     for (let i = 0; i < 2 + ((rng() * 3) | 0); i++) {
       const u = R(rng, -len / 2, len / 2), lz = R(rng, 0.35, 0.85) * (depth * BD * 0.5 + 0.5);
-      b.add(cbox(b, BW * R(rng, 0.9, 1.1), BH, BD, 'sandbag', 0.072), 'sandbag', {
+      b.add(sandbag(b, BW * R(rng, 0.9, 1.1), BH, BD), 'sandbag', {
         pos: f.p(u, BH * 0.5, lz), rot: [R(rng, -0.25, 0.25), f.rotY + rng() * TAU, R(rng, -0.25, 0.25)], collide: false,
       });
     }
