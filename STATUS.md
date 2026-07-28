@@ -1,8 +1,9 @@
 # STATUS — save point
 
 Last saved: 2026-07-28. The build is playable and healthy at this commit.
-Save points: `playable-v1` (first playable), `playable-v2` (AO + budget),
-`playable-v3` (clouds rebuilt) — current.
+Save points: `playable-v1` (first playable), `v2` (AO + draw-call budget),
+`v3` (clouds rebuilt), `v4` (surfaces authored, sandbags rebuilt, enemies
+readable, colour script) — current.
 
 ## Resume in one minute
 
@@ -26,9 +27,11 @@ node scripts/boottime.mjs      # expect ~11 s
 
 **Measured at this save point**
 - 36/36 automated gameplay checks pass
-- Boots in 11.0 s
-- 46–60 fps in combat with 5 enemies
-- **402 draw calls** (budget 450), 1.27 M triangles in a wide establishing view
+- Boots in 10.8 s
+- 45–60 fps in combat with 5 enemies
+- **399 draw calls** (budget 450), 1.32 M triangles in a wide establishing view
+- Enemy uniform vs asphalt at 12 m: value +0.107 (was −0.012), silhouette
+  107–121 px (was 95)
 - Key-to-fill 2.9–3.3 stops, shadow blue/red 1.08–1.43
 - White clipping < 0.25%, black clipping < 6% in every heading
 
@@ -60,15 +63,19 @@ nav grid, procedural WebAudio, wave-based game mode with respawn.
    Cloud march stipple is reduced, not eliminated — visible pixel-peeped at 3x.
 2. **Triangles still above target**: 1.27 M vs a 900 k goal (draw calls are now
    under budget). `src/world/Level.js`, `src/world/Props.js`.
-3. **Enemies still weak at 12 m** — rifle not reading in silhouette, contact
-   shadow too faint, camo too high-frequency. `src/ai/Enemy.js`.
-4. **Viewmodel hip pose oversized**; support hand grips the top of the rail
-   rather than under the handguard. `src/weapons/Weapon.js`, `models.js`.
-5. **Materials**: brick is a perfect running-bond grid; sandbags read as flat
-   tiles rather than bags with sag; barrels are candy-striped.
+3. **Enemies at 20 m on sunlit asphalt** now match the ground in value (−0.004).
+   There is no single value that beats both sunlit asphalt (0.26) and asphalt in
+   shadow (0.12); the fix traded a uniformly-dark figure for a two-tier one so
+   that one tier always contrasts, but mean edge contrast against arbitrary
+   backdrops went 0.095 → 0.083. A rim/backlight term is the likely next move.
+   An enemy actively firing still presents a foreshortened weapon — mitigated by
+   shoulder timing, not solved.
+4. **Support hand grips the top of the rail** rather than under the handguard.
+   `src/weapons/models.js`. (Hip pose size is fixed.)
+5. **Brick still repeats** — a 2.70 m tile across a 20 m elevation, findable if
+   you look. The *grid* is gone; the repeat is not.
 6. **Interior lamps are decorative** — no light pools on the floor.
-7. **Colour script is a flat saturation multiply**, not a value-and-hue plan.
-8. **HUD has no hierarchy** under fire.
+7. **HUD has no hierarchy** under fire.
 9. `ca: 0.0008` is a null effect. Grain dithers visibly in shadows.
 10. The muzzle flash sits behind the support forearm in the hip pose — a
     muzzle/hand relationship problem in the viewmodel pose, not in FX.
