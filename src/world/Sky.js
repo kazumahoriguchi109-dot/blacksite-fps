@@ -255,34 +255,59 @@ function buildWeatherTexture(size, cfg) {
     const p = Math.min(1, Math.max(0, (air - 0.32) / 0.40));
     if (rng() > _smooth(p)) continue;
 
-    // Heavy tail: cubing the uniform puts ~2/3 of the population in the bottom
-    // fifth of the size range and leaves a thin tail of genuine congestus. A
-    // linear draw gives a sky where every cloud is mid-sized, which reads as
-    // uniform even though it technically varies.
+    // Heavy tail, but not too heavy. A linear draw gives a sky where every
+    // cloud is mid-sized, which reads as uniform even though it technically
+    // varies; u^3 goes too far the other way — genuine congestus becomes rare
+    // enough that a 70-degree frame often contains none, and a frame with no
+    // large cloud in it has no scale reference and reads as evenly scattered
+    // blobs. u^2.2 keeps ~1 in 6 above half the maximum radius.
     const u = rng();
-    const r = Math.min(rMax, rMin * Math.pow(ratio, u * u * u) * (0.70 + 0.62 * air));
+    const r = Math.min(rMax, rMin * Math.pow(ratio, Math.pow(u, 2.2)) * (0.70 + 0.62 * air));
     const sizeN = Math.min(1, Math.max(0, Math.log(r / rMin) / logRatio));
 
     area += Math.PI * r * r;
     clouds++;
 
     // Vertical development tracks width — a wide cumulus is a deep one — but
-    // loosely, so two clouds of the same width still differ in height.
-    const towV = Math.min(1, Math.max(0.04,
-      0.14 + 0.82 * Math.pow(sizeN, 0.70) + (rng() - 0.5) * 0.30));
+    // only loosely. The random term is nearly as large as the size term on
+    // purpose: with a tight correlation, angular size and shape become the same
+    // variable and the sky fills with one squat cap repeated at every scale.
+    // Loosened, it carries flat rafts and narrow turrets at the same width.
+    // The floor is not cosmetic: a cloud shallower than ~400 m is thinner than
+    // three march steps, so the start jitter cannot average over it and it
+    // renders as a chalky stippled slab rather than as a cloud.
+    // The ceiling is the other half of it: with a purely additive random term a
+    // 400 m puff can draw a 1 km tower and renders as a smoke stalk, which is
+    // the one silhouette in the population that reads as a bug rather than as
+    // a cloud. Convection does not build columns narrower than they are tall.
+    const towV = Math.min(1, Math.min(0.30 + 0.85 * sizeN, Math.max(0.24,
+      0.22 + 0.52 * Math.pow(sizeN, 0.65) + (rng() - 0.38) * 0.56)));
     const basV = rng();
     const chrV = 0.16 + 0.80 * rng();
-    const amp = 0.74 + 0.26 * rng();
+    const amp = 0.80 + 0.20 * rng();
 
-    const lobes = 2 + (rng() * 4) | 0;
+    // Per-cloud global aspect and bearing, applied to every lobe of THIS cloud.
+    // Without it each cloud is statistically circular — a handful of randomly
+    // placed lobes inside a circular envelope averages to a disc — and a sky of
+    // discs reads as a rhythm however irregularly they are scattered. With it,
+    // some clouds are compact and round and others are long ragged rafts.
+    const gAsp = Math.pow(2.0, (rng() - 0.5) * 1.55);   // 0.59 .. 1.70
+    const gRot = rng() * Math.PI;
+    const gc = Math.cos(gRot), gs = Math.sin(gRot);
+
+    // Big clouds are clusters, small ones are simple. A single lobe is a smooth
+    // ellipse and reads as a marshmallow, so the floor is 2.
+    const lobes = 2 + Math.round(sizeN * 4 + rng() * 1.6);
     for (let l = 0; l < lobes; l++) {
-      const lr = r * (0.44 + 0.54 * rng());
+      const lr = r * (0.40 + 0.52 * rng());
       const off = (r - lr) * scatter * Math.sqrt(rng());
       const oa = rng() * Math.PI * 2;
-      const lx = cx + Math.cos(oa) * off;
-      const ly = cy + Math.sin(oa) * off;
+      const ox = Math.cos(oa) * off * gAsp;
+      const oy = Math.sin(oa) * off / gAsp;
+      const lx = cx + gc * ox - gs * oy;
+      const ly = cy + gs * ox + gc * oy;
 
-      const asp = 0.62 + 0.80 * rng();
+      const asp = 0.55 + 0.95 * rng();
       const rot = rng() * Math.PI;
       const ca = Math.cos(rot), sa = Math.sin(rot);
       const ax = lr, ay = lr * asp;
@@ -300,12 +325,18 @@ function buildWeatherTexture(size, cfg) {
           const py = -sa * dx + ca * dy;
           const u2 = px * px * invAx + py * py * invAy;
           if (u2 >= 1) continue;
-          // Flat-topped: full value inside 0.32 of the lobe, then a smooth
-          // shoulder to zero. A cone-shaped splat thresholds into a circle
-          // whose radius is a linear function of the threshold, which makes
-          // cloudCoverage a size knob instead of a coverage knob.
-          const q = u2 <= 0.10 ? 0.0 : (u2 - 0.10) * 1.111111;
-          const s = amp * (1.0 - q * q * (3.0 - 2.0 * q));
+          // Small flat core, then a LINEAR decay to the rim.
+          //
+          // The obvious profile here is a flat top with a smooth-step shoulder,
+          // and it is wrong. A smoothstep shoulder is steep through its middle,
+          // so the band of partial density the threshold carves out is ~13% of
+          // the cloud's radius — and the 3D erosion below can only MOVE that
+          // level set, not invent one, so with a 13% band it moves the outline
+          // by a few dozen metres and every cloud renders as a smooth river
+          // pebble. That is exactly what the first pass of this rewrite did.
+          // A linear ramp gives a constant gradient, so the erosion gets a band
+          // ~30% of the radius wide to carve, and the outline comes out ragged.
+          const s = amp * Math.min(1.0, (1.0 - Math.sqrt(u2)) * 1.30);
           const i = row + ((((x % N) + N) % N));
           if (s > cov[i]) { cov[i] = s; tow[i] = towV; bas[i] = basV; chr[i] = chrV; }
         }
@@ -317,8 +348,11 @@ function buildWeatherTexture(size, cfg) {
   // A multiplicative modulation at 1.2 / 0.6 / 0.3 km. This does NOT generate
   // shape — it only wobbles the level set — so it cannot re-impose a lattice of
   // blobs; what it does is stop the thresholded outline from being a smooth
-  // ellipse at the 500 m band the 3D erosion volume (which starts at ~620 m and
-  // is identical for every cloud) does not cover.
+  // ellipse at the band the 3D erosion volume cannot reach. That band matters
+  // more than it looks: the erosion volume is a FIXED WORLD SIZE (465 m for its
+  // coarsest lobe), so a 700 m puff gets barely one lobe across it and comes
+  // out a smooth marshmallow no matter how hard the erosion is driven. This
+  // modulation is the only thing that varies the small end of the population.
   {
     const c0 = Math.max(4, Math.round(tileKm / 1.20));
     const g0 = _lattice2(c0, rng), g1 = _lattice2(c0 * 2, rng), g2 = _lattice2(c0 * 4, rng);
@@ -327,10 +361,10 @@ function buildWeatherTexture(size, cfg) {
       for (let x = 0; x < N; x++) {
         if (cov[row + x] <= 0.0) continue;
         const uu = (x + 0.5) / N;
-        const f = 0.55 * _val2(g0, c0, uu, v)
-                + 0.30 * _val2(g1, c0 * 2, uu, v)
-                + 0.15 * _val2(g2, c0 * 4, uu, v);
-        cov[row + x] *= 0.86 + 0.30 * f;
+        const f = 0.42 * _val2(g0, c0, uu, v)
+                + 0.33 * _val2(g1, c0 * 2, uu, v)
+                + 0.25 * _val2(g2, c0 * 4, uu, v);
+        cov[row + x] *= 0.78 + 0.44 * f;
       }
     }
   }
@@ -778,8 +812,8 @@ ${ATMO_COMMON}
   // lozenge" reading. When tower = f(coverage) and coverage is near-binary,
   // every cloud in the sky is exactly the same height and exactly the same
   // vertical profile, so they differ only in outline; the eye reads seven
-  // copies. Read from the map, tower spans 5x across the population and is
-  // uncorrelated with the outline.
+  // copies. Read from the map, tower spans 4x across the population and is
+  // only loosely tied to the outline.
   vec4 cloudWeather(vec2 q){
     vec4 W = texture2D(uWeather, q * uWeatherScale);
     float thr = uCloudThreshold;
@@ -825,12 +859,19 @@ ${ATMO_COMMON}
     // did, visibly, at a fixed 0.085. So the width is handed down from the
     // march: steep rays take short steps and get a knife-edge base, grazing
     // rays take long ones and get a soft base they cannot alias.
-    float base = smoothstep(0.0, soft, hn);
+    // ...but never wider than a fraction of THIS cloud's own depth. A 300 m
+    // fair-weather puff handed the grazing-ray base width (620 m of slab) never
+    // reaches full density at all and renders as a smooth vertical ramp — a
+    // marshmallow. Scaling the ramp to the cloud keeps small clouds sharp.
+    float base = smoothstep(0.0, min(soft, cw.z * 0.42), hn);
     // Full density up to 55% of the tower, then a rounded shoulder. Ramping
     // from 42% gave a cone: the cloud narrowed all the way from base to apex
     // and the deck read as a field of flames seen from below rather than of
     // masses with flanks and a crown.
-    float top  = 1.0 - smoothstep(cw.z * 0.64, cw.z * 1.04, hn);
+    // The shoulder is 60% of the cloud's own depth. A short shoulder gives a
+    // flat top, and a flat-topped shallow cloud reads as a bread loaf; the
+    // crown of a cumulus is the roundest part of it.
+    float top  = 1.0 - smoothstep(cw.z * 0.45, cw.z * 1.06, hn);
     float d = cw.x * base * top;
     if (d <= 0.002) return 0.0;
 
@@ -848,14 +889,22 @@ ${ATMO_COMMON}
     // ray — which is why an over-detailed deck comes out covered in radial
     // scratches rather than in grain. So the finest octave here is the 12-cell
     // worley at ~115 m, and its weight is wound down with distance.
-    float billow = mix(n0.g * 0.52 + n0.b * 0.32 + n0.a * 0.16,
-                       n0.g * 0.38 + n0.b * 0.34 + n0.a * 0.28, lod);
+    // At lod 0 the fine octaves are DROPPED, not merely down-weighted. The
+    // 12-cell worley is a 115 m feature; at 20 km that is 0.33 arc-minutes,
+    // well under a pixel, so keeping it at any weight is not detail, it is a
+    // per-pixel coin flip on a hard density threshold — which is the chalky
+    // speckle that survives on the distant deck.
+    float coarse = n0.g * 0.82 + n0.b * 0.18;
+    float fine   = n0.g * 0.38 + n0.b * 0.34 + n0.a * 0.28;
     // Averaging independent worley octaves collapses their contrast: three
     // fields of sd ~0.20 average to sd ~0.12, and a 0.12 swing in the erosion
     // field moves the silhouette by a few dozen metres, which is invisible.
     // Re-expanding to the full range is the difference between a carved
-    // cauliflower edge and a faint fuzz on an ellipse.
-    billow = clamp((billow - 0.30) * 2.25, 0.0, 1.0);
+    // cauliflower edge and a faint fuzz on an ellipse. The two blends need
+    // different gains because they have different variance to start with.
+    coarse = clamp((coarse - 0.34) * 1.60, 0.0, 1.0);
+    fine   = clamp((fine   - 0.30) * 2.25, 0.0, 1.0);
+    float billow = mix(coarse, fine, lod);
     float wisp = clamp((n0.r - 0.33) * 2.40, 0.0, 1.0);
     // Wispy shreds at the base, packed cauliflower at the crown — the classic
     // cumulus erosion split, and the reason a crown reads as lobes rather than
@@ -870,9 +919,16 @@ ${ATMO_COMMON}
     // The strength is PER CLOUD (cw.w): some are hard-edged cauliflower, some
     // are half dissolved into rag. Two clouds of the same size and height still
     // do not read as the same object if one of them is falling apart.
+    // The distance term used to wind the erosion STRENGTH down as well as its
+    // frequency, and that is what left the mid-field reading as a scatter of
+    // rounded boxes: the coarse taper toward the crown is produced by the
+    // erosion eating the low-density shoulder, so weakening it at 8 km leaves
+    // a prism with a domed lid. Now that lod 0 selects the smooth coarse
+    // octave, full strength at distance is safe and is what gives a cloud 10 km
+    // away the same carved profile as one overhead.
     float k = uCloudDetail * (1.22 - 0.46 * cw.w)
                            * mix(0.88, 1.10, smoothstep(0.05, 0.85, hn))
-                           * mix(0.70, 1.0, clamp(lod, 0.0, 1.0));
+                           * mix(0.92, 1.0, clamp(lod, 0.0, 1.0));
     float gap = min(k * (1.0 - e), 0.96);
     return clamp((d - gap) / (1.0 - gap), 0.0, 1.0);
   }
@@ -921,10 +977,12 @@ ${ATMO_COMMON}
   }
 
   // --------------------------------------------------------------- clouds ---
-  // 36 steps is not extravagance. sigma*dt at one step decides whether a pixel
-  // can go from clear to opaque in a single sample, and if it can, the start
-  // jitter turns that coin flip into per-pixel speckle across the whole deck.
-  // Halving the step length is the only thing that actually removes it.
+  // 36 steps, unchanged, and it is a hard budget: the march measured at parity
+  // with the previous build only because the step COUNT did not move. sigma*dt
+  // at one step decides whether a pixel can go from clear to opaque in a single
+  // sample, and if it can, the start jitter turns that coin flip into speckle.
+  // Everything spent on that problem here is spent on the jitter and on the
+  // extinction instead of on more samples.
   const int CLOUD_STEPS = 36;
   const int CLOUD_LIGHT_STEPS = 3;
 
@@ -980,10 +1038,12 @@ ${ATMO_COMMON}
   }
 
   vec3 applyClouds(vec3 rd, vec3 sky){
-    // The deck is fully faded out at grazing elevations. A slab viewed at 2
-    // degrees is compressed by ~30:1 in elevation, which is exactly the
-    // "horizontal smear" the art review saw — no amount of shaping survives it,
-    // so the honest fix is to stop drawing it there and let the haze take over.
+    // The deck is faded out at grazing elevations, where a slab is compressed
+    // to a horizontal smear no shaping survives. The cutoff is now 1.1 degrees
+    // rather than 2: the deck is marched far enough down a grazing ray to
+    // actually reach the horizon, so it can be allowed to recede into the haze
+    // instead of being cut off in mid-frame — which was half of why it read as
+    // a band hanging across the top rather than as a field.
     float hf = smoothstep(uCloudFade, uCloudFade + 0.055, rd.y);
     if (hf <= 0.001) return sky;
 
@@ -1062,8 +1122,12 @@ ${ATMO_COMMON}
     // speckle. 115 m against the 9/km extinction is sigma*dt ~ 1.0, which is
     // the point where the stratified jitter below can still hide it. The floor
     // stops a near-vertical ray (2 km chord) from spending 36 samples on 60 m
-    // steps it cannot see the benefit of.
-    float dt0 = clamp(span / GSUM, 0.030, 0.115);
+    // steps it cannot see the benefit of. The floor is a budget knob rather
+    // than a quality one: a near-vertical ray only has 1.9 km of chord, so it
+    // breaks out on t > tT long before step 36 whatever the floor is, and at
+    // 50 m it still gets ~20 samples through the slab at 95 m each. Measured,
+    // moving it 30 -> 50 m is 1.4 ms off the zenith pose and invisible.
+    float dt0 = clamp(span / GSUM, 0.050, 0.115);
 
     // Two-lobe HG. The wide lobe is the body of the cloud; the tight forward
     // lobe is the silver lining and is gated on a THIN path to the sun below,
@@ -1083,16 +1147,29 @@ ${ATMO_COMMON}
     // interleaved gradient noise — is fully deterministic and does read as a
     // halftone screen.
     //
-    // Stratification is neither. The 2x2 Bayer index picks WHICH QUARTER of the
-    // step a pixel samples, so the four pixels in every block are guaranteed to
-    // cover all four quarters; the white hash then places the sample randomly
-    // INSIDE its quarter, so there is no fixed pattern to read as a screen. The
-    // variance of the local 2x2 mean drops ~4x, and SMAA and CAS downstream
-    // integrate over exactly that neighbourhood. The block index is rolled per
-    // frame so the assignment is not nailed to the screen in motion.
+    // SCRAMBLED STRATIFICATION is neither of those. A 4x4 Bayer index picks
+    // WHICH SIXTEENTH of the step a pixel samples, so the sixteen pixels in
+    // every block are guaranteed to cover the step evenly and the variance of
+    // the local mean — which is what SMAA, CAS and the eye all actually see —
+    // drops by the stratum count. Then two things break the pattern:
+    //
+    //   1. the index is XORed with a per-BLOCK hash. XOR by a constant is a
+    //      permutation of 0..15, so every block still covers all sixteen
+    //      strata exactly once, but WHICH pixel gets which stratum is
+    //      different in every block. Plain 4x4 Bayer without this reads as a
+    //      woven mesh across the whole deck — measurably lower variance than
+    //      white noise, visibly worse, exactly as the previous pass warned.
+    //   2. the white hash places the sample randomly INSIDE its sixteenth.
+    //
+    // Both hashes take the frame as a third input, so a static camera dissolves
+    // the residue instead of freezing it into the image.
     ivec2 ip = ivec2(gl_FragCoord.xy);
-    int strat = ((((ip.x & 1) * 2) ^ ((ip.y & 1) * 3)) + int(uTime * 30.0)) & 3;
-    float jit = (float(strat) + pixelHash(gl_FragCoord.xy, floor(uTime * 30.0))) * 0.25;
+    float fr = floor(uTime * 30.0);
+    int b2a = (((ip.x >> 1) & 1) * 2) ^ (((ip.y >> 1) & 1) * 3);
+    int b2b = ((ip.x & 1) * 2) ^ ((ip.y & 1) * 3);
+    int scr = int(pixelHash(floor(gl_FragCoord.xy * 0.25), fr) * 15.999);
+    int strat = (b2a * 4 + b2b) ^ scr;
+    float jit = (float(strat) + pixelHash(gl_FragCoord.xy, fr)) * 0.0625;
 
     // Base ramp width, handed to cloudBody. A cumulus base wants to be a knife
     // edge, but a knife edge sampled at 400 m steps aliases into the vertical
@@ -1140,11 +1217,11 @@ ${ATMO_COMMON}
       if (dens > 0.018){
         if (tHit < 0.0) tHit = t;
         float hn = clamp((h - cw.y) / max(1.0 - cw.y, 0.2), 0.0, 1.0);
-        // Once the ray is nine tenths absorbed, the remaining samples move the
-        // final colour by under a percent, so they reuse the last sun march
+        // Once the ray is five sixths absorbed, the remaining samples move the
+        // final colour by a couple of percent, so they reuse the last sun march
         // instead of paying for their own. Deep inside a cumulus that is most
         // of the samples, and the sun march is the single most expensive thing
-        // in the shader.
+        // in the shader — this threshold is the cheapest millisecond in it.
         // Per-cloud density character. Some cells are solid and shadow hard,
         // some are half-condensed rag the sun goes straight through — and that
         // difference in VALUE, not just in outline, is a large part of why a
@@ -1152,7 +1229,7 @@ ${ATMO_COMMON}
         float dmul = 0.62 + 1.05 * cw.w;
 
         float od = lastOD;
-        if (trans > 0.10){
+        if (trans > 0.17){
           od = cloudLightOD(p, hn, dens, cw, soft, jit) * uCloudAbsorb * dmul;
           lastOD = od;
         }
@@ -1174,7 +1251,7 @@ ${ATMO_COMMON}
         float dT = exp(-sigma * dt);
         scat += trans * (1.0 - dT) * S;
         trans *= dT;
-        if (trans < 0.015) break;
+        if (trans < 0.030) break;
       }
       t += dt;
     }
@@ -1363,7 +1440,7 @@ export class Sky {
       sunAzimuthEnd: 285.0,
 
       // --- clouds ---
-      cloudCoverage: 0.46,        // 0 clear .. 1 overcast. Against a splatted
+      cloudCoverage: 0.52,        // 0 clear .. 1 overcast. Against a splatted
                                   // weather map this cuts each cloud's own
                                   // falloff, so it trades gap for mass rather
                                   // than adding or removing whole clouds.
@@ -1404,7 +1481,7 @@ export class Sky {
       // Condensation level, as a slab fraction: each cloud gets its own, flat
       // across its own footprint and staggered against its neighbours.
       cloudBaseLo: 0.0,
-      cloudBaseSpan: 0.20,
+      cloudBaseSpan: 0.26,
       cloudFade: 0.020,           // sin(elevation) below which the deck fades
                                   // out. Lower than before: the deck is now
                                   // marched far enough to actually reach the
@@ -1419,13 +1496,16 @@ export class Sky {
       // past the range aerial perspective has already washed everything out at.
       weatherCells: 16.0,
       // --- cloud population, read at construction to bake the weather map ---
-      // Radii in cloudCellKm units. 0.30..2.10 is a 7x span; the draw is cubed
-      // so the population is mostly small with a thin tail of congestus.
-      cloudRadiusMin: 0.30,
-      cloudRadiusMax: 2.10,
+      // Radii in cloudCellKm units. 0.24..2.15 is a 9x span, i.e. cloud widths
+      // from 0.8 km to 7 km before the coverage threshold cuts them back; the
+      // draw is skewed so the population is mostly small with a real tail of
+      // congestus. This spread is the whole point — it is what the review meant
+      // by "real cumulus over a landscape varies enormously in size".
+      cloudRadiusMin: 0.24,
+      cloudRadiusMax: 2.15,
       // Total splat area as a fraction of the tile, before overlap. Sets how
-      // many clouds get placed (~0.9 -> a few hundred over 26 km).
-      cloudAreaBudget: 0.78,
+      // many clouds get placed — 1.05 lands at 149 clouds over the 26 km tile.
+      cloudAreaBudget: 1.05,
       // How far the 2-5 lobes of one cloud scatter inside it, as a fraction of
       // the room available. 0 is a single smooth ellipse; 1 is a loose cluster.
       cloudLobeScatter: 0.92,
@@ -1493,7 +1573,11 @@ export class Sky {
     // any other way (see buildCloudVolume). Zero external assets.
     const _p = this.params;
     const _cellKm = Math.max(_p.cloudCellKm, 0.10);
-    this._weatherTex = buildWeatherTexture(512, {
+    // 768 rather than 512: one texel is 34 m over a 26 km tile, and the
+    // smallest clouds in the population are only ~800 m across. At 512 their
+    // outlines and the 300 m break octave both landed near the map's Nyquist
+    // and aliased into a chunky, blocky silhouette.
+    this._weatherTex = buildWeatherTexture(768, {
       tileKm: _cellKm * Math.max(_p.weatherCells, 2.0),
       radiusMinKm: _p.cloudRadiusMin * _cellKm,
       radiusMaxKm: _p.cloudRadiusMax * _cellKm,
