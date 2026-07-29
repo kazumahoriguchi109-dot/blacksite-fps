@@ -3,7 +3,7 @@
 Last saved: 2026-07-29. The build is playable and healthy at this commit.
 Save points: `playable-v1` (first playable), `v2` (AO + draw-call budget),
 `v3` (clouds rebuilt), `v4` (surfaces authored, sandbags rebuilt, enemies
-readable, colour script), `v5` (contact shadows and AO reach the screen,
+readable, colour script), `playable-v5` (contact shadows and AO reach the screen,
 HUD hierarchy) — current.
 
 ## Resume in one minute
