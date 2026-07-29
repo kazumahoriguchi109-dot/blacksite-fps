@@ -1,9 +1,10 @@
 # STATUS — save point
 
-Last saved: 2026-07-28. The build is playable and healthy at this commit.
+Last saved: 2026-07-29. The build is playable and healthy at this commit.
 Save points: `playable-v1` (first playable), `v2` (AO + draw-call budget),
 `v3` (clouds rebuilt), `v4` (surfaces authored, sandbags rebuilt, enemies
-readable, colour script) — current.
+readable, colour script), `v5` (contact shadows and AO reach the screen,
+HUD hierarchy) — current.
 
 ## Resume in one minute
 
@@ -28,16 +29,26 @@ node scripts/boottime.mjs      # expect ~11 s
 **Measured at this save point**
 - 36/36 automated gameplay checks pass
 - Boots in 10.8 s
-- 45–60 fps in combat with 5 enemies
+- 45–60 fps in combat with 5 enemies; ~19 fps under `profile.mjs`, which
+  stages 10. Those are different numbers, not a regression — compare like
+  with like before chasing one.
 - **399 draw calls** (budget 450), 1.32 M triangles in a wide establishing view
 - Enemy uniform vs asphalt at 12 m: value +0.107 (was −0.012), silhouette
   107–121 px (was 95)
 - Key-to-fill 2.9–3.3 stops, shadow blue/red 1.08–1.43
 - White clipping < 0.25%, black clipping < 6% in every heading
+- AO reaches the composite: darkens 69% of the frame, mean 19.5/255
+- Squad casts attached shadows: 10.7% of the ground band, 2.12 stops deep
 
-**Independent verdict: "competent indie."** Four harsh-critic passes have been
+**Independent verdict: "competent indie."** Five harsh-critic passes have been
 run. It is not AAA and no reviewer has said otherwise. The remaining gap is
 authored art and content volume, not a bug list.
+
+The fifth pass dropped it to *prototype* over "nothing touches the ground."
+That had three real causes, all now fixed and measured (see `d9cb0d6`): AO was
+applied before fog and before the additive terms that ignored it; shadow
+`normalBias` was ~1.6 texels, detaching every shadow from its caster; and the
+enemy boot — the only part touching the ground — had `castShadow = false`.
 
 ## What is done
 
@@ -80,7 +91,8 @@ nav grid, procedural WebAudio, wave-based game mode with respawn.
 5. **Brick still repeats** — a 2.70 m tile across a 20 m elevation, findable if
    you look. The *grid* is gone; the repeat is not.
 6. **Interior lamps are decorative** — no light pools on the floor.
-7. **HUD has no hierarchy** under fire.
+7. ~~HUD has no hierarchy under fire~~ — done, `bed1265`. Three tiers, outlined
+   glyphs, state words. `hudstates.mjs` covers all eight states.
 9. `ca: 0.0008` is a null effect. Grain dithers visibly in shadows.
 10. The muzzle flash sits behind the support forearm in the hip pose — a
     muzzle/hand relationship problem in the viewmodel pose, not in FX.
@@ -97,6 +109,9 @@ invalidated by bugs *in the tools*:
 | `playtest.mjs` | drives movement, firing, reloading, ADS, grenades, AI, damage, game mode; asserts state changes |
 | `keyfill.mjs` | key-to-fill by sun differencing (renders each frame twice, once with the sun zeroed) |
 | `aodebug.mjs` | dumps the AO buffer directly |
+| `aodiff.mjs` | AO's effect on the **graded frame** (buffer ≠ composite) |
+| `shadowdiff.mjs` | isolates the squad's cast-shadow contribution; finds sunlit ground by raycast rather than assuming it |
+| `hudstates.mjs` | all eight HUD states over the hardest background |
 | `ratchet.mjs` | regression test for the interior-lighting compounding bug |
 | `profile.mjs`, `boottime.mjs`, `overview.mjs`, `enemyshot.mjs`, `fxcost.mjs` | |
 
@@ -115,3 +130,13 @@ invalidated by bugs *in the tools*:
   deleting the sky dome, `pos.y` meaning feet vs eye, poses clamped to standing,
   settling faster than eye adaptation, AI not frozen for enemy shots, Vite
   double-boot, and Vite watching `shots/` so every capture triggered a reload.
+- **A diagnostic that never ran reports a confident zero.** `shadowdiff.mjs`
+  first said "0.00% — the ground receives no cast shadow" three times running.
+  It was screenshotting the title screen (no overlay dismiss), then measuring a
+  scene with no enemies spawned, then aiming the camera at the sun with the
+  squad behind it. Every failure produced a clean, plausible number. Any new
+  instrument must assert its preconditions — dismiss the overlay, check the
+  subject is on screen — and fail loudly rather than measure the wrong frame.
+- **Toggling `castShadow` needs a material recompile.** Same trap as
+  `light.visible`: shadow state is baked into the shader permutation, so an A/B
+  that flips it without `needsUpdate` renders two identical frames.
