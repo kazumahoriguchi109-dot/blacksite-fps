@@ -220,6 +220,29 @@ async function boot() {
   // for a sun this low without smearing contact shadows.
   if (ctx.sky.sunLight?.shadow) ctx.sky.sunLight.shadow.radius = 5;
 
+  /*
+   * Shadow bias. A 4096 map over a 104 m ortho is 25 mm per texel, so the
+   * inherited normalBias of 0.035-0.04 offset every receiver by ~1.5 texels
+   * along its normal — classic peter-panning. It detached every shadow from
+   * its caster at the contact point, which is why nothing in the build looked
+   * like it was resting on the ground: soldiers standing in full sun cast
+   * nothing under their boots, and the sandbag wall floated with daylight
+   * beneath it.
+   *
+   * Traded back for a slightly larger constant depth bias, which pushes the
+   * comparison along the light ray instead of along the surface normal and so
+   * does not move the contact point.
+   */
+  if (ctx.sky.params) {
+    ctx.sky.params.shadowNormalBias = 0.010;
+    ctx.sky.params.shadowBias = -0.00035;
+    ctx.sky.applyParams?.();
+  }
+  if (ctx.sky.sunLight?.shadow) {
+    ctx.sky.sunLight.shadow.normalBias = 0.010;
+    ctx.sky.sunLight.shadow.bias = -0.00035;
+  }
+
   // Put the low sun in the west so it rakes ACROSS the compound. With the
   // default azimuth the sun sat due north, directly behind the admin block,
   // which dropped the entire playable courtyard into one flat shadow.
@@ -657,7 +680,10 @@ async function boot() {
       `pos    ${player.position.x.toFixed(1)} ${player.position.y.toFixed(1)} ${player.position.z.toFixed(1)}`;
   };
 
-  // Expose for debugging / the visual-review tooling.
+  // Expose for debugging / the visual-review tooling. THREE goes with it: the
+  // review scripts need to build Vector3s and Raycasters to stage a shot, and
+  // reconstructing them off `position.constructor` only reaches half the API.
+  ctx.THREE = THREE;
   window.__game = ctx;
   window.__postfx = postfx;
 }
@@ -690,8 +716,10 @@ function makeFallbackSky(scene) {
   sun.shadow.mapSize.set(2048, 2048);
   const c = sun.shadow.camera;
   c.left = -60; c.right = 60; c.top = 60; c.bottom = -60; c.near = 0.5; c.far = 220;
-  sun.shadow.bias = -0.0006;
-  sun.shadow.normalBias = 0.035;
+  // Same peter-panning trade as the real sky: keep the normal offset well
+  // under a texel and take the bias along the light ray instead.
+  sun.shadow.bias = -0.0008;
+  sun.shadow.normalBias = 0.012;
   scene.add(sun);
   const hemi = new THREE.HemisphereLight(0x8fb4de, 0x3a3630, 0.85);
   scene.add(hemi);

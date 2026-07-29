@@ -254,74 +254,78 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   }
 
   for (const p of poses) {
-    await retry(() => page.evaluate((pose) => {
-      const g = window.__game;
-      const pl = g.player;
-      // pose.pos[1] is the FOOT height (0 = standing on the ground). Stance is
-      // declared, not implied by an arbitrary eye number: a crouched eye is
-      // 1.02 m and a standing eye 1.63 m, so any other value was unreachable
-      // and used to be silently clamped to standing.
-      pl.position.set(pose.pos[0], Math.max(0.02, pose.pos[1]), pose.pos[2]);
-      // Drive the real crouch input so the capsule, eye height and camera all
-      // agree, rather than poking a height the controller will undo.
-      if (pose.crouch) g.input.down.add('ControlLeft');
-      else g.input.down.delete('ControlLeft');
-      pl.velocity.set(0, 0, 0);
-      pl.yaw = pose.yaw;
-      pl.pitch = pose.pitch;
-      pl.recoilPitch = 0; pl.recoilYaw = 0; pl.shakeTrauma = 0;
-      pl.bobAmount = 0; pl.landDip = 0; pl.lean = 0;
-      // Always render at the game's real FOV. A per-pose override here made
-      // every captured frame 15-25 degrees wider than what the player sees.
-      pl.baseFov = pose.fov ?? 60;
-      pl.fov = pose.fov ?? 60;
+    // The whole pose is inside retry(), not just the failing step.
+    //
+    // It used to retry only the statement that threw, so a hot-reload between
+    // setting the pose and taking the shot meant the retry re-ran the SHOT at
+    // the freshly-booted default spawn. A review caught this firing live: the
+    // console said "page reloaded during snap 03_container_alley, retrying" and
+    // the resulting PNG was the courtyard, filed under the container-alley name.
+    // The EJECTED guard cannot catch it either, because the eye height was
+    // correct at the moment it was sampled.
+    await retry(async () => {
+      const t0 = await page.evaluate(() => performance.timeOrigin);
 
-      // Face the sun directly when the pose asks for it, so we always get a
-      // real into-the-light shot regardless of the current time of day.
-      if (pose.faceSun && g.sky?.sunDirection) {
-        // sunDirection points FROM the sun TOWARD the scene, so to look AT the
-        // sun the camera forward must be -sunDirection. Camera forward at yaw y
-        // is (sin y, 0, -cos y), so yaw = atan2(d.x, d.z). The previous
-        // atan2(-d.x, -d.z) pointed 180 degrees away — every "into sun" shot
-        // captured so far was an away-from-sun shot.
-        const d = g.sky.sunDirection;
-        pl.yaw = Math.atan2(d.x, d.z);
-        pl.pitch = Math.asin(Math.max(-1, Math.min(1, -d.y))) * 0.9;
-      }
+      await page.evaluate((pose) => {
+        const g = window.__game;
+        const pl = g.player;
+        // pose.pos[1] is the FOOT height. Stance is declared, not implied.
+        pl.position.set(pose.pos[0], Math.max(0.02, pose.pos[1]), pose.pos[2]);
+        if (pose.crouch) g.input.down.add('ControlLeft');
+        else g.input.down.delete('ControlLeft');
+        pl.velocity.set(0, 0, 0);
+        pl.yaw = pose.yaw;
+        pl.pitch = pose.pitch;
+        pl.recoilPitch = 0; pl.recoilYaw = 0; pl.shakeTrauma = 0;
+        pl.bobAmount = 0; pl.landDip = 0; pl.lean = 0;
+        pl.baseFov = pose.fov ?? 60;
+        pl.fov = pose.fov ?? 60;
 
-      if (g.weapons) {
-        // forceAim survives the weapon's "pointer not locked -> stop aiming"
-        // branch, which previously made every ADS capture identical to hip.
-        g.weapons.forceAim = !!pose.ads;
-        g.weapons.aiming = !!pose.ads;
-        g.weapons.adsT = pose.ads ? 1 : 0;
-      }
-      // Settle every spring so the frame is not mid-transition.
-      for (let i = 0; i < 90; i++) {
-        pl.update(1 / 120, g);
-        g.weapons?.update(1 / 120, g);
-      }
-    }, p), p.name);
+        if (pose.faceSun && g.sky?.sunDirection) {
+          // sunDirection points FROM the sun TOWARD the scene, so looking AT
+          // the sun means camera forward = -sunDirection, i.e. atan2(d.x, d.z).
+          const d = g.sky.sunDirection;
+          pl.yaw = Math.atan2(d.x, d.z);
+          pl.pitch = Math.asin(Math.max(-1, Math.min(1, -d.y))) * 0.9;
+        }
+        if (g.weapons) {
+          g.weapons.forceAim = !!pose.ads;
+          g.weapons.aiming = !!pose.ads;
+          g.weapons.adsT = pose.ads ? 1 : 0;
+        }
+        for (let i = 0; i < 90; i++) {
+          pl.update(1 / 120, g);
+          g.weapons?.update(1 / 120, g);
+        }
+      }, p);
 
-    const eye = await retry(() => page.evaluate(() =>
-      +(window.__game.camera.position.y).toFixed(2)), `eye ${p.name}`);
-    if (args.whitebox) await retry(applyWhitebox, `whitebox ${p.name}`);
-    await sleep(900);   // let the pose settle; springs and SMAA need a few frames
-    // I-2: eye adaptation takes 1-3 s to converge, so a short settle left every
-    // frame mid-adaptation and each pose depended on the one before it. Snap it
-    // instead of freezing, so the frame shows the exposure a player would see.
-    await retry(() => page.evaluate(() => window.__game.postfx.snapExposure?.()), `snap ${p.name}`);
-    await sleep(320);
-    const file = path.join(OUT, `${p.name}.png`);
-    await retry(() => page.screenshot({ path: file }), `${p.name} shot`);
-    // Collision ejects the player if a pose lands inside geometry, which
-    // silently reframes the shot — 04_warehouse_int spent several rounds
-    // outdoors on top of a rack this way. Expected eye is foot + 1.63
-    // standing, foot + 1.02 crouched.
-    const expected = (p.pos[1] || 0.02) + (p.crouch ? 1.02 : 1.63);
-    const drift = Math.abs(eye - expected);
-    console.log(`  ✓ ${p.name}  (eye ${eye} m)`
-      + (drift > 0.4 ? `  ** EJECTED: expected ${expected.toFixed(2)} m — pose is inside geometry **` : ''));
+      if (args.whitebox) await applyWhitebox();
+      await sleep(900);
+      await page.evaluate(() => window.__game.postfx.snapExposure?.());
+      await sleep(320);
+
+      // Read the ACHIEVED state immediately before the shutter, and in XZ as
+      // well as Y — collision slides the capsule horizontally with the eye
+      // height untouched, which the Y-only check could never see.
+      const got = await page.evaluate(() => {
+        const g = window.__game;
+        return { x: g.player.position.x, z: g.player.position.z, eye: g.camera.position.y };
+      });
+      const t1 = await page.evaluate(() => performance.timeOrigin);
+      if (t1 !== t0) throw new Error('page reloaded mid-pose');
+
+      const expected = (p.pos[1] || 0.02) + (p.crouch ? 1.02 : 1.63);
+      const dY = Math.abs(got.eye - expected);
+      const dXZ = Math.hypot(got.x - p.pos[0], got.z - p.pos[2]);
+      const warn = [];
+      if (dXZ > 0.25) warn.push(`slid ${dXZ.toFixed(2)} m in XZ`);
+      if (dY > 0.25) warn.push(`eye ${got.eye.toFixed(2)} vs ${expected.toFixed(2)} m`);
+
+      const file = path.join(OUT, `${p.name}.png`);
+      await page.screenshot({ path: file });
+      console.log(`  ✓ ${p.name}  (eye ${got.eye.toFixed(2)} m)`
+        + (warn.length ? `  ** DISPLACED: ${warn.join(', ')} — pose is inside geometry **` : ''));
+    }, p.name);
   }
 
   await writeFile(path.join(OUT, 'stats.json'), JSON.stringify({ stats, poses: poses.map(p => p.name) }, null, 2));

@@ -800,7 +800,11 @@ export class Enemy {
       const an = new THREE.Group();
       an.position.y = -0.42;
       kn.add(an);
-      an.add(mesh(geo.boot, mats.gear, false));
+      // The boot MUST cast. It was the one part excluded, and it is the only
+      // part that touches the ground — so the leg's shadow stopped at the ankle
+      // and left a hole exactly at the contact point. A review called this out
+      // as "no cast shadow under any boot ... they read as pasted-on sprites".
+      an.add(mesh(geo.boot, mats.gear, true));
       B['ankle' + S] = an;
     }
 

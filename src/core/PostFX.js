@@ -439,11 +439,15 @@ const RESOLVE_FRAG = /* glsl */`
     float ev = uExposure * clamp(uKeyValue / adaptedLum, uEvMin, uEvMax);
     col *= ev;
 
-    // --- ambient occlusion (attenuates ambient/indirect, floored so it darkens
-    //     creases rather than crushing directly lit surfaces to black) ---
+    // AO is deliberately NOT applied here. It used to be, and everything below
+    // then undid it: the fog is a lerp toward a constant, which lifts every
+    // occluded pixel back toward the fog colour, and the shaft and bloom terms
+    // are additive and ignored it entirely. In a bright exterior those additive
+    // terms routinely put back more than AO had removed — which is why a
+    // healthy AO buffer (full 0-255 range, 20% mean occlusion) gave no visible
+    // contact darkening anywhere. It is applied after fog instead.
     float ao = texture2D(tAO, vUv).r;
     ao = mix(1.0, ao, uAOStrength * (1.0 - isViewmodel));
-    col *= ao;
     // Debug: show the AO buffer directly so it can be verified rather than
     // assumed. Driven by postfx.params.debugAO.
     if (uDebugAO > 0.5) { gl_FragColor = vec4(vec3(texture2D(tAO, vUv).r), 1.0); return; }
@@ -468,9 +472,18 @@ const RESOLVE_FRAG = /* glsl */`
       col = mix(col, fogCol, clamp(fogAmt, 0.0, 1.0));
     }
 
+    // Occlusion applied last of the multiplicative operations, after fog, so a
+    // crease stays a crease at distance instead of being lerped back toward the
+    // haze colour.
+    col *= ao;
+
     // --- volumetric shafts + bloom ---
-    col += texture2D(tShafts, vUv).r * uSunColor * uShaftStrength * ev;
-    col += texture2D(tBloom, vUv).rgb * uBloomStrength;
+    // Additive, and deliberately attenuated by occlusion as well: a shaft or a
+    // bloom bleed reaching into a contact crease is exactly what was erasing
+    // it. Square-rooted, so open areas keep close to their full glow.
+    float aoAdd = sqrt(ao);
+    col += texture2D(tShafts, vUv).r * uSunColor * uShaftStrength * ev * aoAdd;
+    col += texture2D(tBloom, vUv).rgb * uBloomStrength * aoAdd;
 
     gl_FragColor = vec4(col, 1.0);
   }
