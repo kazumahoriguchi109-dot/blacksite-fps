@@ -239,6 +239,45 @@ const CATALOGUE = {
     note: 'Render blown off in patches, blockwork showing through.',
   },
 
+  /*
+   * Backdrop facades for the 180–350 m skyline ring.
+   *
+   * Three tiers, and the spread between them is the whole point. A ring built
+   * from one material resolves as a single flat band at the horizon no matter
+   * how good that material is, because nothing separates the 180 m buildings
+   * from the 350 m ones. Stepping the value up and the saturation down with
+   * distance does the separating — it is aerial perspective baked into the
+   * albedo, which is cheap and holds up even when the fog term is subtle.
+   *
+   * The 12 m tile is deliberate: these want texture at window scale, not at
+   * concrete-blowhole scale. See surfaceDistantFacade for why.
+   */
+  facade_far_near: {
+    kind: 'distantFacade', seed: 7701, tile: 12.0,
+    surfaceOpts: { bays: 4, floors: 3 },
+    gen: { normalStrength: 0.8, aoRadius: 4, aoStrength: 2.0 },
+    roughness: 1.0, metalness: 0.0, normalScale: 0.45, ao: 0.85, env: 1.0,
+    surface: 'concrete',
+    note: 'Nearest skyline ring (~180 m). Most contrast of the three.',
+  },
+  facade_far_mid: {
+    kind: 'distantFacade', seed: 7723, tile: 12.0,
+    surfaceOpts: { bays: 4, floors: 3 },
+    gen: { normalStrength: 0.6, aoRadius: 4, aoStrength: 1.5 },
+    roughness: 1.0, metalness: 0.0, normalScale: 0.32, ao: 0.90, env: 1.0,
+    surface: 'concrete',
+    note: 'Middle ring (~265 m).',
+  },
+  facade_far_deep: {
+    kind: 'distantFacade', seed: 7741, tile: 12.0,
+    surfaceOpts: { bays: 5, floors: 4 },      // smaller windows read as further
+    gen: { normalStrength: 0.4, aoRadius: 3, aoStrength: 1.0 },
+    roughness: 1.0, metalness: 0.0, normalScale: 0.22, ao: 0.95, env: 1.0,
+    surface: 'concrete',
+    note: 'Outermost ring (~350 m). Flattest — at this range relief is gone ' +
+          'and only the window rhythm survives.',
+  },
+
   // ------------------------------------------------------------------- metal
   metal_panel: {
     kind: 'metal', seed: 5501, tile: 2.0,

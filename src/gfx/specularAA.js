@@ -156,6 +156,10 @@ const DESATURATED = new WeakSet();
 const COLOUR_SCRIPT = [
   { test: /^(asphalt|gravel|dirt|rubber)/,                     saturation: 0.46, value: 0.94 },
   { test: /(warning_stripe|road_marking|hazard)/,              saturation: 1.00, value: 1.00 },
+  // Skyline ring. Greyer and a touch brighter than anything in the playable
+  // area — that difference IS the distance cue. Must sit above the concrete
+  // rule, which would otherwise claim these and hand them near-field values.
+  { test: /^facade_far/,                                       saturation: 0.45, value: 1.03 },
   { test: /^(concrete|brick|plaster|rebar|tile)/,              saturation: 0.74, value: 1.00 },
   { test: /(metal|steel|corrugated|grate|chainlink|sheet)/,    saturation: 0.52, value: 0.94 },
   { test: /^(wood|sandbag|tarp|camo)/,                         saturation: 0.80, value: 1.02 },

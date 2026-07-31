@@ -114,6 +114,8 @@ async function boot() {
     wood_plank: 'wood', wood_crate: 'wood', tile_floor: 'tile',
     sandbag: 'sandbag', rubber: 'polymer', tarp: 'camo',
     glass_dirty: 'tile', glass_broken: 'tile',
+    facade_far_near: 'concrete', facade_far_mid: 'concrete',
+    facade_far_deep: 'concrete',
   };
   function fallbackMaterial(name) {
     if (fallbackCache.has(name)) return fallbackCache.get(name);

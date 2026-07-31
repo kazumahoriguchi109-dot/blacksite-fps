@@ -1200,9 +1200,9 @@ export class Level {
       // Fewer, larger blocks: each one lands in its own 22 m chunk 200-350 m
       // out, so every extra block was a draw call and a shadow draw for a shape
       // that is a few pixels of silhouette.
-      { r: 180, count: 13, hMin: 12, hMax: 36, wMin: 30, wMax: 52 },
-      { r: 265, count: 13, hMin: 18, hMax: 60, wMin: 38, wMax: 68 },
-      { r: 350, count: 11, hMin: 26, hMax: 84, wMin: 46, wMax: 82 },
+      { r: 180, count: 13, hMin: 12, hMax: 36, wMin: 30, wMax: 52, mat: 'facade_far_near' },
+      { r: 265, count: 13, hMin: 18, hMax: 60, wMin: 38, wMax: 68, mat: 'facade_far_mid' },
+      { r: 350, count: 11, hMin: 26, hMax: 84, wMin: 46, wMax: 82, mat: 'facade_far_deep' },
     ];
     for (const ring of rings) {
       for (let i = 0; i < ring.count; i++) {
@@ -1216,22 +1216,39 @@ export class Level {
         // random yaw let it overhang the base into empty air, which at this
         // distance reads as a slab floating in the sky.
         const rotY = R(rng, 0, Math.PI);
-        const mat = rng() < 0.5 ? 'concrete_wall' : 'plaster_damaged';
+        // One facade per ring, not a coin flip between two near-field walls.
+        // The old pair had a 2.4–3.0 m tile, which at 200 m+ is sub-pixel: it
+        // averaged to flat grey and every block resolved as a blank slab.
+        const mat = ring.mat;
         // Sink the base well below grade so no gap can open at the horizon.
+        /*
+         * No chamfer anywhere on the ring.
+         *
+         * A 0.4 m bevel on a 50 m box is well under a pixel at 200-350 m, and
+         * a sub-pixel bevel does not soften an edge — it aliases. Each strip
+         * caught the sky at a grazing angle and resolved as a bright hairline
+         * tracing every box, which is what a review kept reporting as "floating
+         * wireframe quads" in the skyline. Removing it also drops the triangle
+         * count on 37 large boxes for a detail no one can see from 180 m.
+         */
         b.box(w, h + 8, d, [bx, (h + 8) / 2 - 8, bz], mat,
-          { chamfer: 0.4, rotY, collide: false });
+          { chamfer: 0, rotY, collide: false });
         if (rng() < 0.45) {
           // Strictly inset, same yaw, and overlapping the base by a metre so
           // there is never a visible seam.
           const w2 = w * R(rng, 0.42, 0.66), d2 = d * R(rng, 0.42, 0.66);
           const h2 = R(rng, 5, 17);
           b.box(w2, h2 + 1.0, d2, [bx, h - 2 + h2 / 2 - 0.5, bz],
-            mat, { chamfer: 0.3, rotY, collide: false });
+            mat, { chamfer: 0, rotY, collide: false });
           // A roofline plant room, which is what actually breaks a flat roof.
           if (rng() < 0.5) {
-            b.box(w2 * 0.4, R(rng, 2.5, 5), d2 * 0.4,
-              [bx, h - 2 + h2 + 1.5, bz], 'concrete_stained',
-              { chamfer: 0.2, rotY, collide: false });
+            // Sit it ON the setback. It used to be centred 1.5 m above the
+            // setback top regardless of its own height, so anything under 3 m
+            // tall hovered with daylight under it.
+            const ph = R(rng, 2.5, 5);
+            b.box(w2 * 0.4, ph, d2 * 0.4,
+              [bx, h - 2 + h2 + ph / 2 - 0.4, bz], 'concrete_stained',
+              { chamfer: 0, rotY, collide: false });
           }
         }
       }

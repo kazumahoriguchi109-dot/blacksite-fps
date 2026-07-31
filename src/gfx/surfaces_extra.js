@@ -1805,6 +1805,118 @@ function surfacePaintedSteel(seed, opts = {}) {
   };
 }
 
+/**
+ * Backdrop facade — the 180–350 m skyline ring.
+ *
+ * The ring buildings used `concrete_wall`, whose 3 m tile is far below a pixel
+ * at that range. Every detail averaged out and they resolved as flat pale
+ * slabs — the "untextured greybox skyline" a review kept flagging. The problem
+ * was never that they lacked a texture; it was that they lacked one at a scale
+ * the distance preserves.
+ *
+ * So author for the range instead. A building reads as a building because of
+ * its fenestration, and nothing else survives 250 m of aerial perspective. At
+ * that distance ~6.6 px covers a metre, so a 2.4 m window is ~16 px — a strong,
+ * countable rhythm. Everything here is therefore built at window scale and up:
+ * bay grid, spandrels, per-window value scatter, a few voids where the glass is
+ * gone. No fine grain at all; it would only alias.
+ *
+ * Tile is 12 m, giving a 4 x 3 bay grid of ~3 m floors — a plain commercial
+ * block, which is what the silhouette wants to be.
+ */
+function surfaceDistantFacade(seed, o = {}) {
+  const rnd = makeRNG(seed);
+  const BAYS = o.bays ?? 4;             // windows across one 12 m tile
+  const FLOORS = o.floors ?? 3;         // floors per tile -> 4 m floor-to-floor
+  const lit = o.lit ?? 0.0;             // fraction of windows showing interior
+
+  // Per-window constants, drawn once. A window's identity has to be stable
+  // across the whole texture, so this cannot be noise sampled per texel.
+  const N = BAYS * FLOORS;
+  const wDark = new Float32Array(N);    // how black the opening reads
+  const wSky = new Float32Array(N);     // how much sky it bounces back
+  const wGone = new Uint8Array(N);      // glass blown out entirely
+  const wBoard = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    wDark[i] = 0.10 + rnd() * 0.16;
+    wSky[i] = rnd() * rnd();            // squared: mostly dull, a few bright
+    wGone[i] = rnd() < 0.14 ? 1 : 0;
+    wBoard[i] = rnd() < 0.08 ? 1 : 0;
+  }
+
+  // One large-scale field for blotchy weathering across the whole elevation.
+  const grime = makeTileablePerlin2(seed ^ 0x51ab, 2);
+  const bayTint = makeTileablePerlin2(seed ^ 0x2f70, BAYS);
+
+  // Window opening as a fraction of its bay. Piers are wider than spandrels on
+  // a real frame, so the horizontal margin is the larger of the two.
+  const WX = 0.30, WY = 0.22;
+
+  return (u, v) => {
+    const bu = u * BAYS, bv = v * FLOORS;
+    const bi = Math.floor(bu), bj = Math.floor(bv);
+    const fu = bu - bi, fv = bv - bj;
+    const idx = (bj * BAYS + bi) % N;
+
+    // Distance inside the bay, 0 at the window edge, 1 at its centre.
+    const inX = (Math.min(fu, 1 - fu) - WX * 0.5) / (0.5 - WX * 0.5);
+    const inY = (Math.min(fv, 1 - fv) - WY * 0.5) / (0.5 - WY * 0.5);
+    const win = Math.min(inX, inY);                     // >0 inside the opening
+    const open = smoothstep(0.0, 0.10, win);            // soft reveal edge
+
+    const g = fbm(grime, u * 2, v * 2, 3, 0.5);
+    const tint = bayTint(bu, 0.5) * 0.5 + 0.5;
+
+    // --- concrete frame ---------------------------------------------------
+    // Slightly warmer and lighter than the near-field concrete: 250 m of air
+    // does that, and matching the near value makes the ring read as a cutout
+    // pasted at the horizon rather than as distance.
+    let base = 0.50 + tint * 0.06 + g * 0.05;
+    // Spandrel panels sit marginally proud and catch more sky.
+    const spandrel = 1 - smoothstep(0.0, 0.18, Math.abs(inY));
+    base += spandrel * 0.025;
+    let r = base * 1.02, gg = base * 1.00, b = base * 0.95;
+
+    // Grime bleeding down from each sill — the strongest large-scale cue that
+    // a facade has been standing outdoors, and it survives any distance.
+    const belowSill = fv < 0.5 ? smoothstep(0.5, 0.14, fv) : 0;
+    const streak = belowSill * (0.35 + 0.65 * fbm(grime, u * 26, v * 6, 2, 0.5));
+    r -= streak * 0.10; gg -= streak * 0.10; b -= streak * 0.085;
+
+    let h = 0.62 + spandrel * 0.05 + g * 0.03;
+    let rough = 0.86 + g * 0.06;
+
+    // --- the opening ------------------------------------------------------
+    if (open > 0) {
+      const dark = wDark[idx];
+      // Sky bounce is strongest at the top of the pane, where the glass sees
+      // more of the dome. That vertical gradient is what stops a window grid
+      // from reading as a row of identical black stamps.
+      const skyGrad = wSky[idx] * (0.35 + 0.65 * sat(fv * 2 - 0.2));
+      let wr, wg, wb;
+      if (wBoard[idx]) {
+        wr = 0.30; wg = 0.27; wb = 0.23;                // ply over the opening
+        h = mix(h, 0.60, open); rough = mix(rough, 0.92, open);
+      } else if (wGone[idx]) {
+        // No glass: a true void, only the soffit of the reveal catching light.
+        wr = wg = wb = dark * 0.45;
+        h = mix(h, 0.30, open); rough = mix(rough, 0.95, open);
+      } else {
+        wr = dark * 0.9 + skyGrad * 0.42;
+        wg = dark * 0.95 + skyGrad * 0.48;
+        wb = dark * 1.15 + skyGrad * 0.60;              // glass skews blue
+        if (lit > 0 && wSky[idx] > 1 - lit) {
+          wr += 0.30; wg += 0.24; wb += 0.12;
+        }
+        h = mix(h, 0.44, open); rough = mix(rough, 0.22, open);
+      }
+      r = mix(r, wr, open); gg = mix(gg, wg, open); b = mix(b, wb, open);
+    }
+
+    return { h, r: sat(r), g: sat(gg), b: sat(b), rough: clamp(rough, 0.1, 1), metal: 0 };
+  };
+}
+
 // ------------------------------------------------------------ registration --
 
 // Recalibrated replacements for the built-in kinds. Registered under their own
@@ -1832,12 +1944,14 @@ registerSurface('brickPainted', surfaceBrickPainted);
 registerSurface('plasterDamaged', surfacePlasterDamaged);
 registerSurface('rustedMetal', surfaceRustedMetal);
 registerSurface('paintedSteel', surfacePaintedSteel);
+registerSurface('distantFacade', surfaceDistantFacade);
 
 export const EXTRA_SURFACES = [
   'concreteFine', 'asphaltFine', 'gravelFine', 'brickFine', 'woodWeathered',
   'plasterFine', 'sandbagFine',
   'corrugated', 'grate', 'chainlink', 'warningStripe', 'roadMarking', 'rubber',
   'tarp', 'rebar', 'glass', 'concreteStained', 'brickPainted', 'plasterDamaged',
+  'distantFacade',
   'rustedMetal', 'paintedSteel',
 ];
 
