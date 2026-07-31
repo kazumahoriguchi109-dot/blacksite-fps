@@ -3,8 +3,16 @@
 // carry that prefix — but applying it in dev would move the dev server to
 // http://127.0.0.1:5188/blacksite-fps/ and break every script under scripts/,
 // all of which fetch the root.
-export default ({ command }) => ({
-  base: command === 'build' ? '/blacksite-fps/' : '/',
+//
+// `isPreview` matters as much as `command`: for `vite preview` the command is
+// 'serve', not 'build', so keying on command alone left preview serving at the
+// root while the index.html it was serving pointed at /blacksite-fps/assets/….
+// Every asset then 404'd, and the SPA fallback answered each one with 200 and a
+// copy of index.html — so a plain fetch of an asset URL looked fine and only a
+// real browser showed the failure. Preview must match production exactly or it
+// is not a preview.
+export default ({ command, isPreview }) => ({
+  base: command === 'build' || isPreview ? '/blacksite-fps/' : '/',
   server: {
     port: 5188,
     host: '127.0.0.1',

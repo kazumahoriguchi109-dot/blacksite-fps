@@ -36,15 +36,54 @@ const step = async (msg, frac) => {
   await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
 };
 
-/**
- * Optional modules are loaded dynamically so a missing or broken subsystem
- * degrades to a stub instead of taking the whole game down.
+/*
+ * Optional modules load dynamically so a missing or broken subsystem degrades
+ * to a stub instead of taking the whole game down.
+ *
+ * Each import MUST be a literal in this table. The previous version took the
+ * path as a parameter and marked it `@vite-ignore`, which told the bundler not
+ * to analyse it — so in a production build none of these were bundled, and
+ * every one of them 404'd at runtime. The game still "booted", because that is
+ * exactly what the fallback path is for, but it booted with no procedural
+ * materials, no sky, no weapon models and no FX. It looked nothing like the
+ * dev build and reported no error. A literal import is what lets the bundler
+ * see the dependency and emit a chunk for it.
  */
-async function tryImport(path, label) {
+const OPTIONAL = {
+  'materials':      () => import('./gfx/materials.js'),
+  'surfaces_extra': () => import('./gfx/surfaces_extra.js'),
+  'sky':            () => import('./world/Sky.js'),
+  'weapon models':  () => import('./weapons/models.js'),
+  'fx':             () => import('./fx/FXSystem.js'),
+  'audio':          () => import('./audio/AudioEngine.js'),
+  'hud':            () => import('./ui/HUD.js'),
+  'ai':             () => import('./ai/AIDirector.js'),
+};
+
+/*
+ * Which optional modules actually loaded.
+ *
+ * Recorded rather than inferred. A stubbed subsystem is not distinguishable
+ * from a real one by shape — `ctx.mat` is a function either way — so any
+ * check that pokes at the resulting objects can only guess. This is the
+ * ground truth, and scripts/livecheck.mjs asserts on it.
+ */
+export const LOADED = Object.create(null);
+
+async function tryImport(label) {
+  const load = OPTIONAL[label];
+  if (!load) {
+    console.warn(`[boot] no optional module registered under "${label}"`);
+    LOADED[label] = false;
+    return null;
+  }
   try {
-    return await import(/* @vite-ignore */ path);
+    const m = await load();
+    LOADED[label] = true;
+    return m;
   } catch (e) {
     console.warn(`[boot] optional module "${label}" unavailable:`, e.message);
+    LOADED[label] = false;
     return null;
   }
 }
@@ -92,8 +131,8 @@ async function boot() {
 
   // ---------------------------------------------------------- materials ---
   await step('Generating materials', 0.08);
-  const matsMod = await tryImport('./gfx/materials.js', 'materials');
-  const extraMod = await tryImport('./gfx/surfaces_extra.js', 'surfaces_extra');
+  const matsMod = await tryImport('materials');
+  const extraMod = await tryImport('surfaces_extra');
   extraMod?.registerAll?.();
 
   // Texture generation is synchronous and dominates boot: at 512 px the full
@@ -208,7 +247,7 @@ async function boot() {
 
   // ---------------------------------------------------------------- sky ---
   await step('Building atmosphere', 0.42);
-  const skyMod = await tryImport('./world/Sky.js', 'sky');
+  const skyMod = await tryImport('sky');
   if (skyMod?.Sky) {
     ctx.sky = new skyMod.Sky(renderer.renderer, scene);
   } else {
@@ -435,7 +474,7 @@ async function boot() {
 
   // ------------------------------------------------------------ weapons ---
   await step('Loading weapons', 0.62);
-  const modelsMod = await tryImport('./weapons/models.js', 'weapon models');
+  const modelsMod = await tryImport('weapon models');
   const modelFactory = async (kind) => {
     if (modelsMod?.buildWeaponModel) {
       try { return modelsMod.buildWeaponModel(kind); }
@@ -485,7 +524,7 @@ async function boot() {
 
   // ----------------------------------------------------------------- fx ---
   await step('Priming effects', 0.74);
-  const fxMod = await tryImport('./fx/FXSystem.js', 'fx');
+  const fxMod = await tryImport('fx');
   ctx.fx = fxMod?.FXSystem ? new fxMod.FXSystem(ctx) : stubFX();
   if (ctx.fx.root && !ctx.fx.root.parent) scene.add(ctx.fx.root);
   // FX HDR values were authored against a much weaker bloom (threshold 1.05,
@@ -495,20 +534,20 @@ async function boot() {
 
   // -------------------------------------------------------------- audio ---
   await step('Synthesising audio', 0.82);
-  const audioMod = await tryImport('./audio/AudioEngine.js', 'audio');
+  const audioMod = await tryImport('audio');
   ctx.audio = audioMod?.AudioEngine ? new audioMod.AudioEngine() : stubAudio();
   ctx.audio.setListener?.(camera);
 
   // ---------------------------------------------------------------- hud ---
   await step('Initialising HUD', 0.9);
-  const hudMod = await tryImport('./ui/HUD.js', 'hud');
+  const hudMod = await tryImport('hud');
   ctx.hud = hudMod?.HUD ? new hudMod.HUD(document.getElementById('hud'), ctx) : stubHUD();
   ctx.hud.setWeaponName?.(weapons.current.def.name);
   ctx.hud.setAmmo?.(weapons.ammoMag, weapons.ammoReserve);
 
   // ----------------------------------------------------------------- ai ---
   await step('Spawning contacts', 0.96);
-  const aiMod = await tryImport('./ai/AIDirector.js', 'ai');
+  const aiMod = await tryImport('ai');
   ctx.ai = aiMod?.AIDirector ? new aiMod.AIDirector(ctx) : { enemies: [], update() {}, spawnWave() {} };
   if (ctx.ai.root && !ctx.ai.root.parent) scene.add(ctx.ai.root);
 
@@ -686,6 +725,7 @@ async function boot() {
   // review scripts need to build Vector3s and Raycasters to stage a shot, and
   // reconstructing them off `position.constructor` only reaches half the API.
   ctx.THREE = THREE;
+  ctx.loaded = LOADED;
   window.__game = ctx;
   window.__postfx = postfx;
 }
