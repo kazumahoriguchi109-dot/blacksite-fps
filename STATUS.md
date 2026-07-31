@@ -7,6 +7,14 @@ readable, colour script), `playable-v5` (contact shadows and AO reach the screen
 HUD hierarchy), `playable-v6` (skyline authored for its viewing distance) —
 current.
 
+## Live
+
+Playable at **https://kazumahoriguchi109-dot.github.io/blacksite-fps/** —
+deployed from `main` by `.github/workflows/pages.yml` on every push.
+
+After any deploy, run `node scripts/livecheck.mjs`. Booting is NOT the test;
+see the traps below.
+
 ## Resume in one minute
 
 ```bash
@@ -117,6 +125,7 @@ invalidated by bugs *in the tools*:
 | `aodiff.mjs` | AO's effect on the **graded frame** (buffer ≠ composite) |
 | `shadowdiff.mjs` | isolates the squad's cast-shadow contribution; finds sunlit ground by raycast rather than assuming it |
 | `hudstates.mjs` | all eight HUD states over the hardest background |
+| `livecheck.mjs` | asserts a real deployment: nothing 404s and all 8 optional subsystems are the real ones, not stubs |
 | `isolate.mjs` | hide a material class and re-shoot — the only thing that can find a defect inside a merged chunk |
 | `ratchet.mjs` | regression test for the interior-lighting compounding bug |
 | `profile.mjs`, `boottime.mjs`, `overview.mjs`, `enemyshot.mjs`, `fxcost.mjs` | |
@@ -148,6 +157,21 @@ invalidated by bugs *in the tools*:
   "inventory geometry above 18 m" / raycast-at-the-pixel all come back empty
   for a defect that is plainly on screen. Bisect by material class with
   `isolate.mjs` instead.
+- **The degrade-to-stub path hides a broken build completely.** The first
+  Pages deploy returned 200, showed the menu, and came up with a player,
+  weapons and an AI director attached — while running on stubs for all eight
+  optional modules, because `@vite-ignore` kept the bundler from emitting any
+  of them. Optional imports must be literals in the `OPTIONAL` table in
+  `src/main.js`, and `ctx.loaded` records what really loaded; never infer it
+  from object shape, because `ctx.mat` is a function either way.
+- **A dev server is not a deployment, and `vite preview` was not either.** For
+  preview, vite's `command` is `'serve'`, so keying `base` on command alone
+  served preview at the root while its own index.html pointed at
+  `/blacksite-fps/assets/…`. Every asset 404'd and the SPA fallback answered
+  each with 200 and a copy of index.html — so `fetch()`ing an asset URL from
+  node looked perfectly healthy and only a real browser showed the failure.
+  Key on `isPreview` too, and never trust a status code without also checking
+  the content type.
 - **Toggling `castShadow` needs a material recompile.** Same trap as
   `light.visible`: shadow state is baked into the shader permutation, so an A/B
   that flips it without `needsUpdate` renders two identical frames.
