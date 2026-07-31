@@ -4,7 +4,8 @@ Last saved: 2026-07-29. The build is playable and healthy at this commit.
 Save points: `playable-v1` (first playable), `v2` (AO + draw-call budget),
 `v3` (clouds rebuilt), `v4` (surfaces authored, sandbags rebuilt, enemies
 readable, colour script), `playable-v5` (contact shadows and AO reach the screen,
-HUD hierarchy) — current.
+HUD hierarchy), `playable-v6` (skyline authored for its viewing distance) —
+current.
 
 ## Resume in one minute
 
@@ -28,11 +29,12 @@ node scripts/boottime.mjs      # expect ~11 s
 
 **Measured at this save point**
 - 36/36 automated gameplay checks pass
-- Boots in 10.8 s
+- Boots in ~11.6 s
 - 45–60 fps in combat with 5 enemies; ~19 fps under `profile.mjs`, which
   stages 10. Those are different numbers, not a regression — compare like
   with like before chasing one.
-- **399 draw calls** (budget 450), 1.32 M triangles in a wide establishing view
+- **374 draw calls** main pass (budget 450), 1.31 M triangles in a wide
+  establishing view
 - Enemy uniform vs asphalt at 12 m: value +0.107 (was −0.012), silhouette
   107–121 px (was 95)
 - Key-to-fill 2.9–3.3 stops, shadow blue/red 1.08–1.43
@@ -90,6 +92,9 @@ nav grid, procedural WebAudio, wave-based game mode with respawn.
    `src/weapons/models.js`. (Hip pose size is fixed.)
 5. **Brick still repeats** — a 2.70 m tile across a 20 m elevation, findable if
    you look. The *grid* is gone; the repeat is not.
+5b. ~~Untextured greybox skyline + floating wireframe quads~~ — done, `599c956`.
+   The ring has purpose-built facades authored at window scale, and the
+   hairlines were sub-pixel chamfers, now removed.
 6. **Interior lamps are decorative** — no light pools on the floor.
 7. ~~HUD has no hierarchy under fire~~ — done, `bed1265`. Three tiers, outlined
    glyphs, state words. `hudstates.mjs` covers all eight states.
@@ -112,6 +117,7 @@ invalidated by bugs *in the tools*:
 | `aodiff.mjs` | AO's effect on the **graded frame** (buffer ≠ composite) |
 | `shadowdiff.mjs` | isolates the squad's cast-shadow contribution; finds sunlit ground by raycast rather than assuming it |
 | `hudstates.mjs` | all eight HUD states over the hardest background |
+| `isolate.mjs` | hide a material class and re-shoot — the only thing that can find a defect inside a merged chunk |
 | `ratchet.mjs` | regression test for the interior-lighting compounding bug |
 | `profile.mjs`, `boottime.mjs`, `overview.mjs`, `enemyshot.mjs`, `fxcost.mjs` | |
 
@@ -137,6 +143,11 @@ invalidated by bugs *in the tools*:
   squad behind it. Every failure produced a clean, plausible number. Any new
   instrument must assert its preconditions — dismiss the overlay, check the
   subject is on screen — and fail loudly rather than measure the wrong frame.
+- **Chunking defeats every per-mesh diagnostic.** Spatial chunking merges
+  hundreds of props into a handful of meshes, so "find the thin mesh" /
+  "inventory geometry above 18 m" / raycast-at-the-pixel all come back empty
+  for a defect that is plainly on screen. Bisect by material class with
+  `isolate.mjs` instead.
 - **Toggling `castShadow` needs a material recompile.** Same trap as
   `light.visible`: shadow state is baked into the shader permutation, so an A/B
   that flips it without `needsUpdate` renders two identical frames.
