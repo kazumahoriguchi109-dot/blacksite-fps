@@ -1,4 +1,10 @@
-export default {
+// A function, not an object, purely so `base` can differ between dev and build.
+// GitHub Pages serves a project site from /<repo>/, so the built asset URLs must
+// carry that prefix — but applying it in dev would move the dev server to
+// http://127.0.0.1:5188/blacksite-fps/ and break every script under scripts/,
+// all of which fetch the root.
+export default ({ command }) => ({
+  base: command === 'build' ? '/blacksite-fps/' : '/',
   server: {
     port: 5188,
     host: '127.0.0.1',
@@ -30,4 +36,4 @@ export default {
       'three/examples/jsm/utils/BufferGeometryUtils.js',
     ],
   },
-};
+});

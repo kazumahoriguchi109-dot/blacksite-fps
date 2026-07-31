@@ -4,14 +4,24 @@ A first-person shooter built in Three.js. Every texture, mesh, animation and
 sound is generated procedurally at runtime — the repository contains no images,
 no models, and no audio files.
 
+### ▶ [Play in the browser](https://kazumahoriguchi109-dot.github.io/blacksite-fps/)
+
+Needs a desktop browser with WebGL2 (Chrome, Edge, Firefox or Safari 15+) and a
+mouse — it locks the pointer, so it will not play on a phone or tablet. **The
+first load takes 10-20 seconds on a blank screen**: the entire material
+catalogue is synthesised in the browser before the level can be built, and the
+loading bar reports which material it is on. Nothing is downloaded but the code
+itself (~300 kB gzipped), so it is slow once and instant after.
+
+Then click **Deploy** and the browser will ask for pointer lock. Press **Esc**
+to get the cursor back.
+
+To run it locally instead:
+
 ```bash
 npm install
 npm run dev      # http://127.0.0.1:5188
 ```
-
-First load takes a while: the entire material catalogue is synthesised in the
-browser before the level is built. The loading bar reports which material it is
-on.
 
 ## Controls
 
